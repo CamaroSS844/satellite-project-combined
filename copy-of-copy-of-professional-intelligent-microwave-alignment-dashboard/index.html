@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Intelligent Microwave Alignment Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            'text-light-primary': '#1a202c',
+            'text-light-secondary': '#718096',
+            'text-dark-primary': '#e2e8f0',
+            'text-dark-secondary': '#a0aec0',
+            'card-light': '#ffffff',
+            'card-dark': '#2d3748',
+            'accent-blue': '#3b82f6',
+            'accent-red': '#ef4444',
+            'accent-orange': '#f97316',
+            'accent-yellow': '#eab308',
+            'accent-green': '#22c55e',
+          },
+        },
+      },
+    };
+  </script>
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://aistudiocdn.com/react@^19.2.0",
+        "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+        "react/": "https://aistudiocdn.com/react@^19.2.0/"
+      }
+    }
+  </script>
+  <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body class="bg-gray-100 dark:bg-gray-900">
+  <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
