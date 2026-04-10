@@ -1,0 +1,1263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Satellite Alignment Monitoring Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            box-sizing: border-box;
+        }
+        
+        .gauge {
+            position: relative;
+            width: 120px;
+            height: 120px;
+        }
+        
+        .gauge-bg {
+            stroke: #374151;
+            stroke-width: 8;
+            fill: none;
+        }
+        
+        .gauge-fill {
+            stroke-width: 8;
+            fill: none;
+            stroke-linecap: round;
+            transition: stroke-dasharray 0.3s ease;
+        }
+        
+        .compass {
+            position: relative;
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #1f2937, #374151);
+            border: 3px solid #4f46e5;
+        }
+        
+        .compass-needle {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 4px;
+            height: 60px;
+            background: linear-gradient(to top, #ef4444, #fbbf24);
+            transform-origin: bottom center;
+            transform: translate(-50%, -100%);
+            border-radius: 2px;
+            transition: transform 0.5s ease;
+        }
+        
+        .status-pulse {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        .alert-slide {
+            animation: slideIn 0.5s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        
+        .gradient-bg {
+            background: linear-gradient(135deg, #0f172a, #1e293b, #334155);
+        }
+        
+        .glass-effect {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        /* Light theme styles */
+        .light-theme {
+            background: linear-gradient(135deg, #f8fafc, #e2e8f0, #cbd5e1) !important;
+            color: #1e293b !important;
+        }
+        
+        .light-theme .glass-effect {
+            background: rgba(255, 255, 255, 0.8) !important;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(0, 0, 0, 0.1) !important;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
+        }
+        
+        .light-theme .gauge-bg {
+            stroke: #cbd5e1 !important;
+        }
+        
+        .light-theme .compass {
+            background: linear-gradient(135deg, #f1f5f9, #e2e8f0) !important;
+            border: 3px solid #4f46e5 !important;
+        }
+        
+        .light-theme .bg-gray-800 {
+            background-color: #f1f5f9 !important;
+        }
+        
+        .light-theme .bg-gray-700 {
+            background-color: #e2e8f0 !important;
+        }
+        
+        .light-theme .text-gray-300 {
+            color: #64748b !important;
+        }
+        
+        .light-theme .text-gray-400 {
+            color: #94a3b8 !important;
+        }
+        
+        .light-theme .text-gray-200 {
+            color: #475569 !important;
+        }
+        
+        .light-theme .text-gray-500 {
+            color: #64748b !important;
+        }
+        
+        .light-theme .border-gray-700 {
+            border-color: #cbd5e1 !important;
+        }
+    </style>
+</head>
+<body class="gradient-bg min-h-screen text-white font-sans">
+    <!-- Header -->
+    <header class="absolute glass-effect border-b border-gray-700 z-50 p-6 w-full">
+        <div class="max-w-7xl mx-auto flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
+                    Satellite Alignment Monitoring
+                </h1>
+                <p class="text-gray-300 mt-1">Real-time tracking and control system</p>
+            </div>
+            <div class="flex items-center space-x-6">
+                <div class="text-right">
+                    <p class="text-sm text-gray-400">Last Update</p>
+                    <p class="text-lg font-mono" id="timestamp">--:--:--</p>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <!-- Notifications -->
+                    <div class="relative">
+                        <button id="notificationToggle" onclick="toggleNotifications()" class="relative flex items-center justify-center w-10 h-10 rounded-lg glass-effect hover:bg-white/10 transition-colors">
+                            <div class="text-xl">🔔</div>
+                            <div id="notificationBadge" class="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-xs rounded-full flex items-center justify-center font-bold">3</div>
+                        </button>
+                        
+                        <!-- Notification Dropdown -->
+                        <div id="notificationDropdown" class="absolute right-0 top-12 w-80 glass-effect rounded-xl border border-gray-700 shadow-2xl z-50 hidden">
+                            <div class="p-4 border-b border-gray-700">
+                                <div class="flex justify-between items-center">
+                                    <h3 class="text-lg font-semibold text-gray-200">Notifications</h3>
+                                    <button onclick="clearAllNotifications()" class="text-xs text-blue-400 hover:text-blue-300">Clear All</button>
+                                </div>
+                            </div>
+                            <div id="notificationList" class="max-h-96 overflow-y-auto">
+                                <!-- Notifications will be populated here -->
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Report Download -->
+                    <button onclick="downloadReport()" class="flex items-center space-x-2 px-4 py-2 rounded-lg glass-effect hover:bg-white/10 transition-colors">
+                        <div class="text-lg">📊</div>
+                        <span class="text-sm font-medium">Report</span>
+                    </button>
+                    
+                    <!-- Theme Toggle -->
+                    <button id="themeToggle" onclick="toggleTheme()" class="flex items-center space-x-2 px-4 py-2 rounded-lg glass-effect hover:bg-white/10 transition-colors">
+                        <div id="themeIcon" class="text-xl">🌙</div>
+                        <span id="themeText" class="text-sm font-medium">Dark</span>
+                    </button>
+                    
+                    <!-- System Status -->
+                    <div class="flex items-center space-x-2">
+                        <div id="systemStatus" class="w-4 h-4 rounded-full bg-green-500 status-pulse"></div>
+                        <span id="systemStatusText" class="font-semibold">OPERATIONAL</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <div class="absolute max-w-7xl mx-auto p-6 space-y-6 mt-[100px] w-full">
+        <!-- Station Panels -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <!-- Station A -->
+            <div class="glass-effect rounded-xl p-6" style="z-index: 2;">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold text-blue-400">Station A</h2>
+                    <div class="flex items-center space-x-2">
+                        <div id="statusA" class="w-3 h-3 rounded-full bg-green-500"></div>
+                        <span id="modeA" class="px-3 py-1 rounded-full text-sm font-semibold bg-green-900 text-green-300">AUTO</span>
+                    </div>
+                </div>
+                
+                <div class="grid grid-cols-2 gap-6 mb-6">
+                    <!-- Azimuth Gauge -->
+                    <div class="text-center">
+                        <h3 class="text-lg font-semibold mb-3 text-gray-300">Azimuth</h3>
+                        <div class="gauge mx-auto mb-3">
+                            <svg width="120" height="120" class="transform -rotate-90">
+                                <circle cx="60" cy="60" r="50" class="gauge-bg"></circle>
+                                <circle cx="60" cy="60" r="50" class="gauge-fill stroke-blue-500" id="azimuthGaugeA" 
+                                        stroke-dasharray="0 314" stroke-dashoffset="0"></circle>
+                            </svg>
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <div class="text-center">
+                                    <div id="azimuthValueA" class="text-2xl font-bold text-blue-400">245°</div>
+                                    <div class="text-xs text-gray-400">AZ</div>
+                                </div>
+                            </div>
+                        </div>
+                        <input type="range" id="azimuthSliderA" min="0" max="360" value="245" 
+                               class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                    </div>
+                    
+                    <!-- Elevation Gauge -->
+                    <div class="text-center">
+                        <h3 class="text-lg font-semibold mb-3 text-gray-300">Elevation</h3>
+                        <div class="gauge mx-auto mb-3">
+                            <svg width="120" height="120" class="transform -rotate-90">
+                                <circle cx="60" cy="60" r="50" class="gauge-bg"></circle>
+                                <circle cx="60" cy="60" r="50" class="gauge-fill stroke-green-500" id="elevationGaugeA" 
+                                        stroke-dasharray="0 314" stroke-dashoffset="0"></circle>
+                            </svg>
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <div class="text-center">
+                                    <div id="elevationValueA" class="text-2xl font-bold text-green-400">32°</div>
+                                    <div class="text-xs text-gray-400">EL</div>
+                                </div>
+                            </div>
+                        </div>
+                        <input type="range" id="elevationSliderA" min="0" max="90" value="32" 
+                               class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                    </div>
+                </div>
+                
+                <!-- Compass Visualization -->
+                <div class="flex justify-center mb-6">
+                    <div class="compass">
+                        <div id="compassNeedleA" class="compass-needle" style="transform: translate(-50%, -100%) rotate(245deg);"></div>
+                        <div class="absolute inset-0 flex items-center justify-center">
+                            <div class="text-xs font-bold">N</div>
+                        </div>
+                        <div class="absolute top-2 left-1/2 transform -translate-x-1/2 text-xs font-bold">N</div>
+                        <div class="absolute bottom-2 left-1/2 transform -translate-x-1/2 text-xs font-bold">S</div>
+                        <div class="absolute left-2 top-1/2 transform -translate-y-1/2 text-xs font-bold">W</div>
+                        <div class="absolute right-2 top-1/2 transform -translate-y-1/2 text-xs font-bold">E</div>
+                    </div>
+                </div>
+                
+                <!-- Signal Strength -->
+                <div class="mb-4">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-sm text-gray-300">Signal Strength</span>
+                        <span id="signalA" class="text-sm font-bold text-green-400">-67 dBm</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div id="signalBarA" class="bg-green-500 h-2 rounded-full" style="width: 85%"></div>
+                    </div>
+                </div>
+                
+                <!-- Control Buttons -->
+                <div class="grid grid-cols-4 gap-2">
+                    <button onclick="setMode('A', 'AUTO')" class="px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-semibold transition-colors">AUTO</button>
+                    <button onclick="setMode('A', 'MANUAL')" class="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm font-semibold transition-colors">MANUAL</button>
+                    <button onclick="setMode('A', 'MAINT')" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded text-sm font-semibold transition-colors">MAINT</button>
+                    <button onclick="setMode('A', 'ERROR')" class="px-3 py-2 bg-red-600 hover:bg-red-700 rounded text-sm font-semibold transition-colors">ERROR</button>
+                </div>
+            </div>
+
+            <!-- Station B -->
+            <div class="glass-effect rounded-xl p-6" style="z-index: 2;">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold text-purple-400">Station B</h2>
+                    <div class="flex items-center space-x-2">
+                        <div id="statusB" class="w-3 h-3 rounded-full bg-yellow-500"></div>
+                        <span id="modeB" class="px-3 py-1 rounded-full text-sm font-semibold bg-yellow-900 text-yellow-300">MANUAL</span>
+                    </div>
+                </div>
+                
+                <div class="grid grid-cols-2 gap-6 mb-6">
+                    <!-- Azimuth Gauge -->
+                    <div class="text-center">
+                        <h3 class="text-lg font-semibold mb-3 text-gray-300">Azimuth</h3>
+                        <div class="gauge mx-auto mb-3">
+                            <svg width="120" height="120" class="transform -rotate-90">
+                                <circle cx="60" cy="60" r="50" class="gauge-bg"></circle>
+                                <circle cx="60" cy="60" r="50" class="gauge-fill stroke-purple-500" id="azimuthGaugeB" 
+                                        stroke-dasharray="0 314" stroke-dashoffset="0"></circle>
+                            </svg>
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <div class="text-center">
+                                    <div id="azimuthValueB" class="text-2xl font-bold text-purple-400">128°</div>
+                                    <div class="text-xs text-gray-400">AZ</div>
+                                </div>
+                            </div>
+                        </div>
+                        <input type="range" id="azimuthSliderB" min="0" max="360" value="128" 
+                               class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                    </div>
+                    
+                    <!-- Elevation Gauge -->
+                    <div class="text-center">
+                        <h3 class="text-lg font-semibold mb-3 text-gray-300">Elevation</h3>
+                        <div class="gauge mx-auto mb-3">
+                            <svg width="120" height="120" class="transform -rotate-90">
+                                <circle cx="60" cy="60" r="50" class="gauge-bg"></circle>
+                                <circle cx="60" cy="60" r="50" class="gauge-fill stroke-orange-500" id="elevationGaugeB" 
+                                        stroke-dasharray="0 314" stroke-dashoffset="0"></circle>
+                            </svg>
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <div class="text-center">
+                                    <div id="elevationValueB" class="text-2xl font-bold text-orange-400">58°</div>
+                                    <div class="text-xs text-gray-400">EL</div>
+                                </div>
+                            </div>
+                        </div>
+                        <input type="range" id="elevationSliderB" min="0" max="90" value="58" 
+                               class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                    </div>
+                </div>
+                
+                <!-- Compass Visualization -->
+                <div class="flex justify-center mb-6">
+                    <div class="compass">
+                        <div id="compassNeedleB" class="compass-needle" style="transform: translate(-50%, -100%) rotate(128deg);"></div>
+                        <div class="absolute top-2 left-1/2 transform -translate-x-1/2 text-xs font-bold">N</div>
+                        <div class="absolute bottom-2 left-1/2 transform -translate-x-1/2 text-xs font-bold">S</div>
+                        <div class="absolute left-2 top-1/2 transform -translate-y-1/2 text-xs font-bold">W</div>
+                        <div class="absolute right-2 top-1/2 transform -translate-y-1/2 text-xs font-bold">E</div>
+                    </div>
+                </div>
+                
+                <!-- Signal Strength -->
+                <div class="mb-4">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-sm text-gray-300">Signal Strength</span>
+                        <span id="signalB" class="text-sm font-bold text-yellow-400">-72 dBm</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div id="signalBarB" class="bg-yellow-500 h-2 rounded-full" style="width: 70%"></div>
+                    </div>
+                </div>
+                
+                <!-- Control Buttons -->
+                <div class="grid grid-cols-4 gap-2">
+                    <button onclick="setMode('B', 'AUTO')" class="px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-semibold transition-colors">AUTO</button>
+                    <button onclick="setMode('B', 'MANUAL')" class="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm font-semibold transition-colors">MANUAL</button>
+                    <button onclick="setMode('B', 'MAINT')" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded text-sm font-semibold transition-colors">MAINT</button>
+                    <button onclick="setMode('B', 'ERROR')" class="px-3 py-2 bg-red-600 hover:bg-red-700 rounded text-sm font-semibold transition-colors">ERROR</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Alerts Panel -->
+        <div class="glass-effect rounded-xl p-6">
+            <h2 class="text-xl font-bold mb-4 text-gray-200">System Alerts & Notifications</h2>
+            <div id="alertsContainer" class="space-y-2 max-h-40 overflow-y-auto">
+                <div class="flex items-center space-x-3 p-3 bg-green-900/30 border border-green-700 rounded-lg">
+                    <div class="w-2 h-2 bg-green-500 rounded-full"></div>
+                    <span class="text-green-300 text-sm">Station A: Tracking nominal - Signal lock maintained</span>
+                    <span class="text-xs text-gray-400 ml-auto">12:34:56</span>
+                </div>
+                <div class="flex items-center space-x-3 p-3 bg-yellow-900/30 border border-yellow-700 rounded-lg">
+                    <div class="w-2 h-2 bg-yellow-500 rounded-full"></div>
+                    <span class="text-yellow-300 text-sm">Station B: Manual mode active - Operator control enabled</span>
+                    <span class="text-xs text-gray-400 ml-auto">12:33:21</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Environmental Conditions & Signal Trends -->
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            <!-- Environmental Conditions -->
+            <div class="glass-effect rounded-xl p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-200">Environmental Conditions</h2>
+                <div class="space-y-4">
+                    <!-- Weather Station A -->
+                    <div class="bg-gray-800/50 rounded-lg p-4">
+                        <h3 class="text-sm font-semibold text-blue-400 mb-3">Station A Environment</h3>
+                        <div class="grid grid-cols-2 gap-3 text-sm">
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Temperature:</span>
+                                <span id="tempA" class="text-blue-400 font-mono">23.5°C</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Humidity:</span>
+                                <span id="humidityA" class="text-blue-400 font-mono">45%</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Wind Speed:</span>
+                                <span id="windA" class="text-blue-400 font-mono">12 km/h</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Pressure:</span>
+                                <span id="pressureA" class="text-blue-400 font-mono">1013 hPa</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Rain Rate:</span>
+                                <span id="rainA" class="text-green-400 font-mono">0.0 mm/h</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Visibility:</span>
+                                <span id="visibilityA" class="text-green-400 font-mono">15+ km</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Weather Station B -->
+                    <div class="bg-gray-800/50 rounded-lg p-4">
+                        <h3 class="text-sm font-semibold text-purple-400 mb-3">Station B Environment</h3>
+                        <div class="grid grid-cols-2 gap-3 text-sm">
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Temperature:</span>
+                                <span id="tempB" class="text-purple-400 font-mono">19.2°C</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Humidity:</span>
+                                <span id="humidityB" class="text-purple-400 font-mono">68%</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Wind Speed:</span>
+                                <span id="windB" class="text-purple-400 font-mono">8 km/h</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Pressure:</span>
+                                <span id="pressureB" class="text-purple-400 font-mono">1009 hPa</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Rain Rate:</span>
+                                <span id="rainB" class="text-yellow-400 font-mono">2.1 mm/h</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-300">Visibility:</span>
+                                <span id="visibilityB" class="text-yellow-400 font-mono">8.5 km</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Signal Strength Trends -->
+            <div class="xl:col-span-2 glass-effect rounded-xl p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-200">Signal Strength Trends (Last 30 Minutes)</h2>
+                <div class="bg-gray-800/50 rounded-lg p-4 h-64">
+                    <canvas id="signalChart" width="600" height="200" class="w-full h-full"></canvas>
+                </div>
+                <div class="flex justify-center space-x-6 mt-4">
+                    <div class="flex items-center space-x-2">
+                        <div class="w-3 h-3 bg-blue-500 rounded-full"></div>
+                        <span class="text-sm text-gray-300">Station A</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <div class="w-3 h-3 bg-purple-500 rounded-full"></div>
+                        <span class="text-sm text-gray-300">Station B</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <div class="w-3 h-3 bg-red-500 rounded-full"></div>
+                        <span class="text-sm text-gray-300">Critical Threshold (-80 dBm)</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Station Map -->
+        <div class="glass-effect rounded-xl p-6">
+            <h2 class="text-xl font-bold mb-4 text-gray-200">Station Locations & Coverage</h2>
+            <div class="bg-gray-800 rounded-lg p-4 h-64 flex items-center justify-center relative overflow-hidden">
+                <!-- Simple map representation -->
+                <div class="absolute inset-0 opacity-20">
+                    <svg width="100%" height="100%" viewBox="0 0 400 200">
+                        <!-- Grid lines -->
+                        <defs>
+                            <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+                                <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#374151" stroke-width="1"/>
+                            </pattern>
+                        </defs>
+                        <rect width="100%" height="100%" fill="url(#grid)" />
+                    </svg>
+                </div>
+                
+                <!-- Station A -->
+                <div class="absolute left-1/4 top-1/3 text-center">
+                    <div class="w-4 h-4 bg-blue-500 rounded-full mb-1 mx-auto"></div>
+                    <div class="text-xs text-blue-400 font-semibold">Station A</div>
+                    <div class="text-xs text-gray-400">245° AZ</div>
+                </div>
+                
+                <!-- Station B -->
+                <div class="absolute right-1/4 top-2/3 text-center">
+                    <div class="w-4 h-4 bg-purple-500 rounded-full mb-1 mx-auto"></div>
+                    <div class="text-xs text-purple-400 font-semibold">Station B</div>
+                    <div class="text-xs text-gray-400">128° AZ</div>
+                </div>
+                
+                <div class="text-center text-gray-500">
+                    <div class="text-lg">🛰️</div>
+                    <div class="text-sm">Satellite Coverage Map</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Detail Modal -->
+    <div id="notificationModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 hidden flex items-center justify-center">
+        <div class="glass-effect rounded-xl p-6 max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-xl font-bold text-gray-200">Notification Details</h2>
+                <button onclick="closeNotificationModal()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <div id="notificationModalContent">
+                <!-- Detailed notification content will be populated here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize dashboard
+        let stationData = {
+            A: { 
+                azimuth: 245, elevation: 32, mode: 'AUTO', signal: -67,
+                temp: 23.5, humidity: 45, wind: 12, pressure: 1013, rain: 0.0, visibility: 15
+            },
+            B: { 
+                azimuth: 128, elevation: 58, mode: 'MANUAL', signal: -72,
+                temp: 19.2, humidity: 68, wind: 8, pressure: 1009, rain: 2.1, visibility: 8.5
+            }
+        };
+
+        // Notification system
+        let notifications = [
+            {
+                id: 1,
+                type: 'warning',
+                title: 'Signal Degradation Alert',
+                message: 'Station B signal strength below optimal threshold',
+                timestamp: new Date(Date.now() - 300000).toLocaleString(),
+                details: 'Station B is experiencing signal degradation with current strength at -72 dBm. This is below the optimal operating range of -65 dBm. Weather conditions may be affecting the link quality. Rain rate is currently 2.1 mm/h which could contribute to signal attenuation.',
+                station: 'B',
+                severity: 'medium',
+                read: false
+            },
+            {
+                id: 2,
+                type: 'info',
+                title: 'Maintenance Window Scheduled',
+                message: 'Station A scheduled for routine maintenance',
+                timestamp: new Date(Date.now() - 600000).toLocaleString(),
+                details: 'Station A has been scheduled for routine maintenance on the tracking system. The maintenance window is planned for 02:00-04:00 UTC tomorrow. During this time, the station will be in maintenance mode and tracking will be temporarily suspended.',
+                station: 'A',
+                severity: 'low',
+                read: false
+            },
+            {
+                id: 3,
+                type: 'success',
+                title: 'System Optimization Complete',
+                message: 'Automatic calibration completed successfully',
+                timestamp: new Date(Date.now() - 900000).toLocaleString(),
+                details: 'The automatic calibration routine has completed successfully for both stations. Signal quality has improved by 3.2 dBm on average. The tracking accuracy has been enhanced and all systems are operating within nominal parameters.',
+                station: 'Both',
+                severity: 'low',
+                read: true
+            }
+        ];
+
+        let notificationIdCounter = 4;
+
+        // Signal history for trending (last 30 data points)
+        let signalHistory = {
+            A: Array.from({length: 30}, (_, i) => -67 + Math.sin(i * 0.2) * 3 + (Math.random() - 0.5) * 2),
+            B: Array.from({length: 30}, (_, i) => -72 + Math.cos(i * 0.15) * 4 + (Math.random() - 0.5) * 3),
+            timestamps: Array.from({length: 30}, (_, i) => {
+                const now = new Date();
+                now.setMinutes(now.getMinutes() - (29 - i));
+                return now.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'});
+            })
+        };
+
+        function updateTimestamp() {
+            const now = new Date();
+            document.getElementById('timestamp').textContent = now.toLocaleTimeString();
+        }
+
+        function drawSignalChart() {
+            const canvas = document.getElementById('signalChart');
+            const ctx = canvas.getContext('2d');
+            
+            // Set canvas size
+            canvas.width = canvas.offsetWidth * 2;
+            canvas.height = canvas.offsetHeight * 2;
+            ctx.scale(2, 2);
+            
+            const width = canvas.offsetWidth;
+            const height = canvas.offsetHeight;
+            
+            // Theme-aware colors
+            const isLight = document.body.classList.contains('light-theme');
+            const bgColor = isLight ? '#f1f5f9' : '#1f2937';
+            const gridColor = isLight ? '#cbd5e1' : '#374151';
+            const textColor = isLight ? '#475569' : '#9ca3af';
+            
+            // Clear canvas
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(0, 0, width, height);
+            
+            // Draw grid
+            ctx.strokeStyle = gridColor;
+            ctx.lineWidth = 1;
+            
+            // Horizontal grid lines
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+            
+            // Vertical grid lines
+            for (let i = 0; i <= 6; i++) {
+                const x = (width / 6) * i;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, height);
+                ctx.stroke();
+            }
+            
+            // Draw critical threshold line
+            const criticalY = height - (((-80 + 90) / 30) * height);
+            ctx.strokeStyle = '#ef4444';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(0, criticalY);
+            ctx.lineTo(width, criticalY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            
+            // Draw signal lines
+            const drawSignalLine = (data, color) => {
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                
+                data.forEach((signal, index) => {
+                    const x = (width / (data.length - 1)) * index;
+                    const y = height - (((signal + 90) / 30) * height);
+                    
+                    if (index === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                });
+                
+                ctx.stroke();
+                
+                // Draw data points
+                ctx.fillStyle = color;
+                data.forEach((signal, index) => {
+                    const x = (width / (data.length - 1)) * index;
+                    const y = height - (((signal + 90) / 30) * height);
+                    
+                    ctx.beginPath();
+                    ctx.arc(x, y, 3, 0, 2 * Math.PI);
+                    ctx.fill();
+                });
+            };
+            
+            drawSignalLine(signalHistory.A, '#3b82f6');
+            drawSignalLine(signalHistory.B, '#8b5cf6');
+            
+            // Draw Y-axis labels
+            ctx.fillStyle = textColor;
+            ctx.font = '12px monospace';
+            ctx.textAlign = 'right';
+            
+            for (let i = 0; i <= 6; i++) {
+                const value = -90 + (i * 5);
+                const y = height - ((i / 6) * height) + 4;
+                ctx.fillText(`${value} dBm`, width - 5, y);
+            }
+            
+            // Draw X-axis labels (time)
+            ctx.textAlign = 'center';
+            for (let i = 0; i < signalHistory.timestamps.length; i += 5) {
+                const x = (width / (signalHistory.timestamps.length - 1)) * i;
+                ctx.fillText(signalHistory.timestamps[i], x, height - 5);
+            }
+        }
+
+        function updateEnvironmentalData() {
+            // Station A environmental updates
+            document.getElementById('tempA').textContent = `${stationData.A.temp.toFixed(1)}°C`;
+            document.getElementById('humidityA').textContent = `${stationData.A.humidity}%`;
+            document.getElementById('windA').textContent = `${stationData.A.wind} km/h`;
+            document.getElementById('pressureA').textContent = `${stationData.A.pressure} hPa`;
+            document.getElementById('rainA').textContent = `${stationData.A.rain.toFixed(1)} mm/h`;
+            document.getElementById('visibilityA').textContent = stationData.A.visibility >= 15 ? '15+ km' : `${stationData.A.visibility.toFixed(1)} km`;
+            
+            // Station B environmental updates
+            document.getElementById('tempB').textContent = `${stationData.B.temp.toFixed(1)}°C`;
+            document.getElementById('humidityB').textContent = `${stationData.B.humidity}%`;
+            document.getElementById('windB').textContent = `${stationData.B.wind} km/h`;
+            document.getElementById('pressureB').textContent = `${stationData.B.pressure} hPa`;
+            document.getElementById('rainB').textContent = `${stationData.B.rain.toFixed(1)} mm/h`;
+            document.getElementById('visibilityB').textContent = `${stationData.B.visibility.toFixed(1)} km`;
+            
+            // Update rain rate colors based on intensity
+            const rainAElement = document.getElementById('rainA');
+            const rainBElement = document.getElementById('rainB');
+            
+            if (stationData.A.rain === 0) {
+                rainAElement.className = 'text-green-400 font-mono';
+            } else if (stationData.A.rain < 2.5) {
+                rainAElement.className = 'text-yellow-400 font-mono';
+            } else {
+                rainAElement.className = 'text-red-400 font-mono';
+            }
+            
+            if (stationData.B.rain === 0) {
+                rainBElement.className = 'text-green-400 font-mono';
+            } else if (stationData.B.rain < 2.5) {
+                rainBElement.className = 'text-yellow-400 font-mono';
+            } else {
+                rainBElement.className = 'text-red-400 font-mono';
+            }
+        }
+
+        function updateGauge(station, type, value) {
+            const maxValue = type === 'azimuth' ? 360 : 90;
+            const percentage = (value / maxValue) * 100;
+            const circumference = 2 * Math.PI * 50; // radius = 50
+            const strokeDasharray = (percentage / 100) * circumference;
+            
+            document.getElementById(`${type}Gauge${station}`).style.strokeDasharray = `${strokeDasharray} ${circumference}`;
+            document.getElementById(`${type}Value${station}`).textContent = `${value}°`;
+            
+            if (type === 'azimuth') {
+                document.getElementById(`compassNeedle${station}`).style.transform = 
+                    `translate(-50%, -100%) rotate(${value}deg)`;
+            }
+        }
+
+        function setMode(station, mode) {
+            stationData[station].mode = mode;
+            const modeElement = document.getElementById(`mode${station}`);
+            const statusElement = document.getElementById(`status${station}`);
+            
+            // Update mode display and colors
+            modeElement.textContent = mode;
+            modeElement.className = 'px-3 py-1 rounded-full text-sm font-semibold';
+            
+            switch(mode) {
+                case 'AUTO':
+                    modeElement.classList.add('bg-green-900', 'text-green-300');
+                    statusElement.className = 'w-3 h-3 rounded-full bg-green-500';
+                    break;
+                case 'MANUAL':
+                    modeElement.classList.add('bg-blue-900', 'text-blue-300');
+                    statusElement.className = 'w-3 h-3 rounded-full bg-blue-500';
+                    break;
+                case 'MAINT':
+                    modeElement.classList.add('bg-yellow-900', 'text-yellow-300');
+                    statusElement.className = 'w-3 h-3 rounded-full bg-yellow-500';
+                    break;
+                case 'ERROR':
+                    modeElement.classList.add('bg-red-900', 'text-red-300');
+                    statusElement.className = 'w-3 h-3 rounded-full bg-red-500';
+                    break;
+            }
+            
+            addAlert(station, mode);
+            updateSystemStatus();
+            
+            // Add notification for mode changes
+            const modeMessages = {
+                'AUTO': 'Station switched to automatic tracking mode',
+                'MANUAL': 'Station switched to manual control mode',
+                'MAINT': 'Station entered maintenance mode - tracking suspended',
+                'ERROR': 'Station error detected - immediate attention required'
+            };
+            
+            const notificationTypes = {
+                'AUTO': 'success',
+                'MANUAL': 'info',
+                'MAINT': 'warning',
+                'ERROR': 'error'
+            };
+            
+            const severities = {
+                'AUTO': 'low',
+                'MANUAL': 'medium',
+                'MAINT': 'medium',
+                'ERROR': 'high'
+            };
+            
+            addNotification(
+                notificationTypes[mode],
+                `Station ${station} Mode Change`,
+                modeMessages[mode],
+                `Station ${station} has been switched to ${mode} mode. ${mode === 'ERROR' ? 'This requires immediate operator attention to diagnose and resolve the system fault.' : mode === 'MAINT' ? 'Tracking operations are temporarily suspended for maintenance activities.' : mode === 'MANUAL' ? 'Operator control is now active for manual positioning.' : 'Automatic tracking system is now controlling station positioning.'}`,
+                station,
+                severities[mode]
+            );
+        }
+
+        function addAlert(station, mode) {
+            const alertsContainer = document.getElementById('alertsContainer');
+            const timestamp = new Date().toLocaleTimeString();
+            
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'flex items-center space-x-3 p-3 rounded-lg alert-slide';
+            
+            let alertClass, dotClass, message;
+            switch(mode) {
+                case 'AUTO':
+                    alertClass = 'bg-green-900/30 border border-green-700';
+                    dotClass = 'w-2 h-2 bg-green-500 rounded-full';
+                    message = `Station ${station}: Switched to automatic mode`;
+                    break;
+                case 'MANUAL':
+                    alertClass = 'bg-blue-900/30 border border-blue-700';
+                    dotClass = 'w-2 h-2 bg-blue-500 rounded-full';
+                    message = `Station ${station}: Manual control activated`;
+                    break;
+                case 'MAINT':
+                    alertClass = 'bg-yellow-900/30 border border-yellow-700';
+                    dotClass = 'w-2 h-2 bg-yellow-500 rounded-full';
+                    message = `Station ${station}: Maintenance mode enabled`;
+                    break;
+                case 'ERROR':
+                    alertClass = 'bg-red-900/30 border border-red-700';
+                    dotClass = 'w-2 h-2 bg-red-500 rounded-full';
+                    message = `Station ${station}: ERROR - System fault detected`;
+                    break;
+            }
+            
+            alertDiv.className += ` ${alertClass}`;
+            alertDiv.innerHTML = `
+                <div class="${dotClass}"></div>
+                <span class="text-sm">${message}</span>
+                <span class="text-xs text-gray-400 ml-auto">${timestamp}</span>
+            `;
+            
+            alertsContainer.insertBefore(alertDiv, alertsContainer.firstChild);
+            
+            // Keep only last 5 alerts
+            while (alertsContainer.children.length > 5) {
+                alertsContainer.removeChild(alertsContainer.lastChild);
+            }
+        }
+
+        function updateSystemStatus() {
+            const hasError = stationData.A.mode === 'ERROR' || stationData.B.mode === 'ERROR';
+            const hasMaint = stationData.A.mode === 'MAINT' || stationData.B.mode === 'MAINT';
+            
+            const statusElement = document.getElementById('systemStatus');
+            const statusText = document.getElementById('systemStatusText');
+            
+            if (hasError) {
+                statusElement.className = 'w-4 h-4 rounded-full bg-red-500 status-pulse';
+                statusText.textContent = 'SYSTEM ERROR';
+            } else if (hasMaint) {
+                statusElement.className = 'w-4 h-4 rounded-full bg-yellow-500 status-pulse';
+                statusText.textContent = 'MAINTENANCE';
+            } else {
+                statusElement.className = 'w-4 h-4 rounded-full bg-green-500 status-pulse';
+                statusText.textContent = 'OPERATIONAL';
+            }
+        }
+
+        // Slider event listeners
+        document.getElementById('azimuthSliderA').addEventListener('input', function(e) {
+            const value = parseInt(e.target.value);
+            stationData.A.azimuth = value;
+            updateGauge('A', 'azimuth', value);
+        });
+
+        document.getElementById('elevationSliderA').addEventListener('input', function(e) {
+            const value = parseInt(e.target.value);
+            stationData.A.elevation = value;
+            updateGauge('A', 'elevation', value);
+        });
+
+        document.getElementById('azimuthSliderB').addEventListener('input', function(e) {
+            const value = parseInt(e.target.value);
+            stationData.B.azimuth = value;
+            updateGauge('B', 'azimuth', value);
+        });
+
+        document.getElementById('elevationSliderB').addEventListener('input', function(e) {
+            const value = parseInt(e.target.value);
+            stationData.B.elevation = value;
+            updateGauge('B', 'elevation', value);
+        });
+
+        // Initialize gauges and start updates
+        updateGauge('A', 'azimuth', stationData.A.azimuth);
+        updateGauge('A', 'elevation', stationData.A.elevation);
+        updateGauge('B', 'azimuth', stationData.B.azimuth);
+        updateGauge('B', 'elevation', stationData.B.elevation);
+
+        // Update timestamp every second
+        setInterval(updateTimestamp, 1000);
+        updateTimestamp();
+
+        // Simulate signal fluctuations and environmental changes
+        setInterval(() => {
+            // Signal variations
+            stationData.A.signal = -67 + (Math.random() - 0.5) * 6;
+            stationData.B.signal = -72 + (Math.random() - 0.5) * 8;
+            
+            // Environmental variations
+            stationData.A.temp += (Math.random() - 0.5) * 0.5;
+            stationData.A.humidity += Math.floor((Math.random() - 0.5) * 2);
+            stationData.A.wind += (Math.random() - 0.5) * 1;
+            stationData.A.pressure += (Math.random() - 0.5) * 0.5;
+            
+            stationData.B.temp += (Math.random() - 0.5) * 0.3;
+            stationData.B.humidity += Math.floor((Math.random() - 0.5) * 3);
+            stationData.B.wind += (Math.random() - 0.5) * 0.8;
+            stationData.B.pressure += (Math.random() - 0.5) * 0.3;
+            stationData.B.rain += (Math.random() - 0.5) * 0.2;
+            stationData.B.visibility += (Math.random() - 0.5) * 0.5;
+            
+            // Keep values in realistic ranges
+            stationData.A.temp = Math.max(15, Math.min(35, stationData.A.temp));
+            stationData.A.humidity = Math.max(20, Math.min(80, stationData.A.humidity));
+            stationData.A.wind = Math.max(0, Math.min(25, stationData.A.wind));
+            stationData.A.pressure = Math.max(990, Math.min(1030, stationData.A.pressure));
+            
+            stationData.B.temp = Math.max(10, Math.min(30, stationData.B.temp));
+            stationData.B.humidity = Math.max(30, Math.min(90, stationData.B.humidity));
+            stationData.B.wind = Math.max(0, Math.min(20, stationData.B.wind));
+            stationData.B.pressure = Math.max(990, Math.min(1025, stationData.B.pressure));
+            stationData.B.rain = Math.max(0, Math.min(10, stationData.B.rain));
+            stationData.B.visibility = Math.max(2, Math.min(15, stationData.B.visibility));
+            
+            // Update displays
+            document.getElementById('signalA').textContent = `${stationData.A.signal.toFixed(0)} dBm`;
+            document.getElementById('signalB').textContent = `${stationData.B.signal.toFixed(0)} dBm`;
+            
+            // Update signal bars
+            const signalPercentA = Math.max(0, Math.min(100, ((-stationData.A.signal + 90) / 30) * 100));
+            const signalPercentB = Math.max(0, Math.min(100, ((-stationData.B.signal + 90) / 30) * 100));
+            
+            document.getElementById('signalBarA').style.width = `${signalPercentA}%`;
+            document.getElementById('signalBarB').style.width = `${signalPercentB}%`;
+            
+            // Update environmental data
+            updateEnvironmentalData();
+            
+            // Update signal history every 10 seconds
+            if (Date.now() % 10000 < 2000) {
+                // Add new data point and remove oldest
+                signalHistory.A.shift();
+                signalHistory.B.shift();
+                signalHistory.timestamps.shift();
+                
+                signalHistory.A.push(stationData.A.signal);
+                signalHistory.B.push(stationData.B.signal);
+                
+                const now = new Date();
+                signalHistory.timestamps.push(now.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'}));
+                
+                drawSignalChart();
+            }
+        }, 2000);
+
+        // Notification functions
+        function updateNotificationBadge() {
+            const unreadCount = notifications.filter(n => !n.read).length;
+            const badge = document.getElementById('notificationBadge');
+            
+            if (unreadCount > 0) {
+                badge.textContent = unreadCount;
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+
+        function renderNotifications() {
+            const notificationList = document.getElementById('notificationList');
+            
+            if (notifications.length === 0) {
+                notificationList.innerHTML = `
+                    <div class="p-4 text-center text-gray-400">
+                        <div class="text-4xl mb-2">📭</div>
+                        <p>No notifications</p>
+                    </div>
+                `;
+                return;
+            }
+
+            notificationList.innerHTML = notifications.map(notification => {
+                const typeColors = {
+                    warning: 'border-yellow-500 bg-yellow-900/20',
+                    error: 'border-red-500 bg-red-900/20',
+                    info: 'border-blue-500 bg-blue-900/20',
+                    success: 'border-green-500 bg-green-900/20'
+                };
+
+                const typeIcons = {
+                    warning: '⚠️',
+                    error: '❌',
+                    info: 'ℹ️',
+                    success: '✅'
+                };
+
+                return `
+                    <div class="p-4 border-b border-gray-700 hover:bg-white/5 cursor-pointer transition-colors ${!notification.read ? 'bg-blue-900/10' : ''}" 
+                         onclick="openNotificationDetail(${notification.id})">
+                        <div class="flex items-start space-x-3">
+                            <div class="text-lg">${typeIcons[notification.type]}</div>
+                            <div class="flex-1 min-w-0">
+                                <div class="flex justify-between items-start">
+                                    <h4 class="text-sm font-semibold text-gray-200 truncate">${notification.title}</h4>
+                                    <span class="text-xs text-gray-400 ml-2">${new Date(notification.timestamp).toLocaleTimeString()}</span>
+                                </div>
+                                <p class="text-xs text-gray-300 mt-1 line-clamp-2">${notification.message}</p>
+                                <div class="flex justify-between items-center mt-2">
+                                    <span class="text-xs px-2 py-1 rounded ${typeColors[notification.type]} border">${notification.station}</span>
+                                    ${!notification.read ? '<div class="w-2 h-2 bg-blue-500 rounded-full"></div>' : ''}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function toggleNotifications() {
+            const dropdown = document.getElementById('notificationDropdown');
+            dropdown.classList.toggle('hidden');
+            
+            if (!dropdown.classList.contains('hidden')) {
+                renderNotifications();
+                // Close dropdown when clicking outside
+                setTimeout(() => {
+                    document.addEventListener('click', closeNotificationsOnOutsideClick);
+                }, 100);
+            } else {
+                document.removeEventListener('click', closeNotificationsOnOutsideClick);
+            }
+        }
+
+        function closeNotificationsOnOutsideClick(event) {
+            const dropdown = document.getElementById('notificationDropdown');
+            const toggle = document.getElementById('notificationToggle');
+            
+            if (!dropdown.contains(event.target) && !toggle.contains(event.target)) {
+                dropdown.classList.add('hidden');
+                document.removeEventListener('click', closeNotificationsOnOutsideClick);
+            }
+        }
+
+        function openNotificationDetail(notificationId) {
+            const notification = notifications.find(n => n.id === notificationId);
+            if (!notification) return;
+
+            // Mark as read
+            notification.read = true;
+            updateNotificationBadge();
+            renderNotifications();
+
+            const modal = document.getElementById('notificationModal');
+            const content = document.getElementById('notificationModalContent');
+
+            const typeColors = {
+                warning: 'text-yellow-400 border-yellow-500',
+                error: 'text-red-400 border-red-500',
+                info: 'text-blue-400 border-blue-500',
+                success: 'text-green-400 border-green-500'
+            };
+
+            const typeIcons = {
+                warning: '⚠️',
+                error: '❌',
+                info: 'ℹ️',
+                success: '✅'
+            };
+
+            content.innerHTML = `
+                <div class="space-y-4">
+                    <div class="flex items-center space-x-3">
+                        <div class="text-2xl">${typeIcons[notification.type]}</div>
+                        <div>
+                            <h3 class="text-lg font-semibold ${typeColors[notification.type]}">${notification.title}</h3>
+                            <p class="text-sm text-gray-400">${notification.timestamp}</p>
+                        </div>
+                    </div>
+                    
+                    <div class="border-l-4 ${typeColors[notification.type]} pl-4 py-2">
+                        <p class="text-gray-300">${notification.message}</p>
+                    </div>
+                    
+                    <div class="bg-gray-800/50 rounded-lg p-4">
+                        <h4 class="text-sm font-semibold text-gray-200 mb-2">Detailed Description</h4>
+                        <p class="text-sm text-gray-300 leading-relaxed">${notification.details}</p>
+                    </div>
+                    
+                    <div class="flex justify-between items-center pt-4 border-t border-gray-700">
+                        <div class="flex space-x-4 text-sm text-gray-400">
+                            <span><strong>Station:</strong> ${notification.station}</span>
+                            <span><strong>Severity:</strong> ${notification.severity.toUpperCase()}</span>
+                        </div>
+                        <button onclick="dismissNotification(${notification.id})" 
+                                class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm transition-colors">
+                            Dismiss
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            modal.classList.remove('hidden');
+        }
+
+        function closeNotificationModal() {
+            document.getElementById('notificationModal').classList.add('hidden');
+        }
+
+        function dismissNotification(notificationId) {
+            notifications = notifications.filter(n => n.id !== notificationId);
+            updateNotificationBadge();
+            renderNotifications();
+            closeNotificationModal();
+        }
+
+        function clearAllNotifications() {
+            notifications = [];
+            updateNotificationBadge();
+            renderNotifications();
+            document.getElementById('notificationDropdown').classList.add('hidden');
+        }
+
+        function addNotification(type, title, message, details, station, severity = 'medium') {
+            const notification = {
+                id: notificationIdCounter++,
+                type,
+                title,
+                message,
+                timestamp: new Date().toLocaleString(),
+                details,
+                station,
+                severity,
+                read: false
+            };
+            
+            notifications.unshift(notification);
+            updateNotificationBadge();
+            
+            // Keep only last 20 notifications
+            if (notifications.length > 20) {
+                notifications = notifications.slice(0, 20);
+            }
+        }
+
+        function downloadReport() {
+            // Generate comprehensive report data
+            const reportData = {
+                timestamp: new Date().toISOString(),
+                systemStatus: document.getElementById('systemStatusText').textContent,
+                stations: {
+                    A: {
+                        ...stationData.A,
+                        currentSignal: document.getElementById('signalA').textContent
+                    },
+                    B: {
+                        ...stationData.B,
+                        currentSignal: document.getElementById('signalB').textContent
+                    }
+                },
+                signalHistory: signalHistory,
+                notifications: notifications,
+                summary: {
+                    totalNotifications: notifications.length,
+                    unreadNotifications: notifications.filter(n => !n.read).length,
+                    averageSignalA: (signalHistory.A.reduce((a, b) => a + b, 0) / signalHistory.A.length).toFixed(1),
+                    averageSignalB: (signalHistory.B.reduce((a, b) => a + b, 0) / signalHistory.B.length).toFixed(1)
+                }
+            };
+
+            // Create downloadable JSON report
+            const reportJson = JSON.stringify(reportData, null, 2);
+            const blob = new Blob([reportJson], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `satellite-monitoring-report-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            // Add notification about report download
+            addNotification(
+                'success',
+                'Report Downloaded',
+                'System monitoring report has been generated and downloaded',
+                `A comprehensive system report has been generated containing current station status, signal history, environmental data, and notification logs. The report covers the period from ${signalHistory.timestamps[0]} to ${signalHistory.timestamps[signalHistory.timestamps.length - 1]}.`,
+                'System',
+                'low'
+            );
+        }
+
+        // Theme toggle functionality
+        let isDarkTheme = true;
+        
+        function toggleTheme() {
+            isDarkTheme = !isDarkTheme;
+            const body = document.body;
+            const themeIcon = document.getElementById('themeIcon');
+            const themeText = document.getElementById('themeText');
+            
+            if (isDarkTheme) {
+                body.classList.remove('light-theme');
+                themeIcon.textContent = '🌙';
+                themeText.textContent = 'Dark';
+            } else {
+                body.classList.add('light-theme');
+                themeIcon.textContent = '☀️';
+                themeText.textContent = 'Light';
+            }
+            
+            // Redraw chart with new theme
+            setTimeout(() => {
+                drawSignalChart();
+            }, 100);
+        }
+
+        // Initialize system status and displays
+        updateSystemStatus();
+        updateEnvironmentalData();
+        updateNotificationBadge();
+        
+        // Draw initial chart
+        setTimeout(() => {
+            drawSignalChart();
+        }, 100);
+
+        // Close modal when clicking outside
+        document.getElementById('notificationModal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeNotificationModal();
+            }
+        });
+    </script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9895223bf2c038df',t:'MTc1OTU4NTY3My4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
