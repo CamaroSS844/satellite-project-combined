@@ -9,6 +9,8 @@ import TrendsPanel from './components/TrendsPanel';
 import AlertsPanel from './components/AlertsPanel';
 import KpiPanel from './components/KpiPanel';
 import { useTheme } from './hooks/useTheme';
+import BeamAlignmentPanel from './components/Beamalignmentpanel';
+import PolarRadiationPanel from './components/Polarradiationpanel';
 
 const App: React.FC = () => {
   const [theme, toggleTheme] = useTheme();
@@ -49,20 +51,27 @@ const App: React.FC = () => {
           </div>
         ))}
 
-        {/* Second Row: Monitoring Content */}
-        <div className="col-span-12 lg:col-span-6 space-y-4">
-          <AlertsPanel alerts={alerts} />
-          <TrendsPanel data={trendData} aiInsight={aiInsight} />
-        </div>
-        
-        <div className="col-span-12 lg:col-span-3 space-y-4">
-           <SystemOverviewPanel backendStatus={backendStatus} statusLog={statusLog} />
-        </div>
-
-        <div className="col-span-12 lg:col-span-3 space-y-4">
+        <div className="col-span-12 lg:col-span-12 space-y-4">
           {/* Environmental panel mapping updated to support multiple stations if available */}
           <EnvironmentalPanel stationA={stations[0] || {} as any} stationB={stations[1] || {} as any} />
           <KpiPanel kpis={kpis} />
+        </div>
+
+
+        {/* Second Row: Monitoring Content */}
+        
+        <div className="col-span-12 lg:col-span-6 space-y-4">
+           {/* <SystemOverviewPanel backendStatus={backendStatus} statusLog={statusLog} /> */}
+           <BeamAlignmentPanel />
+        </div>
+
+        <div className="col-span-12 lg:col-span-6 space-y-4">
+          <PolarRadiationPanel stationLabel={stations[0]?.name || 'Station 1'} pattern={stations[0]?.radiationPattern || []} />
+        </div>
+
+        <div className="col-span-12 lg:col-span-6 space-y-4">
+          <AlertsPanel alerts={alerts} />
+          {/* <TrendsPanel data={trendData} aiInsight={aiInsight} /> */}
         </div>
       </main>
     </div>

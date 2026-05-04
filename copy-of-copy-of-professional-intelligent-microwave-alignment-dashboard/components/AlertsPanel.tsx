@@ -1,9 +1,13 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import Card, { CardHeader, CardTitle } from './common/Card';
-import { Alert } from '../types';
-import { SEVERITY_COLORS } from '../constants';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
+interface Alert {
+  id: string | number;
+  timestamp: string;
+  severity: string;
+  message: string;
+}
+
 interface BackendLog {
   ts: string;
   station_id: string;
@@ -36,6 +40,94 @@ type AlertSeverity = 'info' | 'warning' | 'error';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:8000';
 
+// ── Design tokens (mirror the HTML dashboard exactly) ─────────────────────────
+const styles = {
+  card: {
+    background: '#0d1224',
+    border: '1px solid #1e2a4a',
+    borderRadius: '6px',
+    padding: '14px',
+    fontFamily: "'Syne', sans-serif",
+    color: '#e2e8f0',
+  } as React.CSSProperties,
+
+  cardTitle: {
+    fontSize: '10px',
+    fontWeight: 700,
+    letterSpacing: '0.15em',
+    color: '#475569',
+    textTransform: 'uppercase' as const,
+    margin: '0 0 12px',
+  } as React.CSSProperties,
+
+  kpi: {
+    background: '#060b18',
+    borderRadius: '4px',
+    padding: '10px 12px',
+  } as React.CSSProperties,
+
+  kpiLabel: {
+    fontSize: '10px',
+    color: '#475569',
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    marginBottom: '4px',
+  } as React.CSSProperties,
+
+  kpiNum: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: '17px',
+    fontWeight: 500,
+    color: '#e2e8f0',
+  } as React.CSSProperties,
+
+  mono: {
+    fontFamily: "'IBM Plex Mono', monospace",
+  } as React.CSSProperties,
+
+  btn: {
+    fontFamily: "'Syne', sans-serif",
+    fontSize: '11px',
+    fontWeight: 700,
+    letterSpacing: '0.08em',
+    padding: '6px 14px',
+    borderRadius: '3px',
+    border: 'none',
+    cursor: 'pointer',
+    textTransform: 'uppercase' as const,
+  } as React.CSSProperties,
+
+  btnActive: {
+    background: '#166534',
+    color: '#4ade80',
+  } as React.CSSProperties,
+
+  btnManual: {
+    background: '#1e2a4a',
+    color: '#64748b',
+  } as React.CSSProperties,
+
+  modeBtn: {
+    fontFamily: "'Syne', sans-serif",
+    fontSize: '10px',
+    fontWeight: 700,
+    letterSpacing: '0.08em',
+    padding: '5px 14px',
+    cursor: 'pointer',
+    textTransform: 'uppercase' as const,
+    border: 'none',
+    flex: 1,
+    textAlign: 'center' as const,
+  } as React.CSSProperties,
+} as const;
+
+// ── Severity styles matching the dashboard log tags ───────────────────────────
+const severityStyles: Record<AlertSeverity, { bg: string; color: string; tagBg: string; tagColor: string; label: string }> = {
+  info:    { bg: '#0c1a3a', color: '#60a5fa', tagBg: '#0c1a3a',  tagColor: '#60a5fa', label: 'INFO' },
+  warning: { bg: '#231a05', color: '#fbbf24', tagBg: '#231a05',  tagColor: '#fbbf24', label: 'WARN' },
+  error:   { bg: '#1f0a0a', color: '#f87171', tagBg: '#1f0a0a',  tagColor: '#f87171', label: 'ERR'  },
+};
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const safeNum = (n: unknown): number =>
   typeof n === 'number' && isFinite(n) ? n : 0;
@@ -43,10 +135,6 @@ const safeNum = (n: unknown): number =>
 const fmt = (n: unknown, decimals = 1): string =>
   isFinite(Number(n)) ? Number(n).toFixed(decimals) : '—';
 
-/**
- * Maps backend log level strings → one of the three keys that exist
- * in SEVERITY_COLORS. Guards against any unexpected level value.
- */
 const levelToSeverity = (level: string): AlertSeverity => {
   const l = (level ?? '').toUpperCase();
   if (l === 'ERROR') return 'error';
@@ -54,33 +142,46 @@ const levelToSeverity = (level: string): AlertSeverity => {
   return 'info';
 };
 
-/**
- * Safe accessor — returns an empty object with bg/text fallbacks if
- * the key is missing from SEVERITY_COLORS (prevents the crash).
- */
-const severityStyle = (sev: AlertSeverity) =>
-  SEVERITY_COLORS[sev] ?? { bg: '', text: '' };
-
 // ── Sub-components ────────────────────────────────────────────────────────────
-const KpiCard: React.FC<{
-  label: string;
-  value: string;
-  sub?: string;
-  color?: string;
-}> = ({ label, value, sub, color = 'text-accent-green' }) => (
-  <div className="bg-bg-light-secondary dark:bg-bg-dark-secondary rounded-lg p-3 flex flex-col gap-1">
-    <span className="text-xs text-text-light-secondary dark:text-text-dark-secondary">{label}</span>
-    <span className={`text-xl font-bold ${color}`}>{value}</span>
-    {sub && (
-      <span className="text-[10px] text-text-light-secondary dark:text-text-dark-secondary">
-        {sub}
-      </span>
-    )}
+
+/** Matches .log-entry in the HTML */
+const LogEntry: React.FC<{ time: string; tag: string; severity: AlertSeverity; msg: string }> = ({ time, tag, severity, msg }) => {
+  const s = severityStyles[severity];
+  return (
+    <div style={{
+      display: 'flex', gap: '8px', padding: '7px 0',
+      borderBottom: '1px solid #0f172a',
+      fontSize: '11px', fontFamily: "'IBM Plex Mono', monospace",
+    }}>
+      <span style={{ color: '#334155', minWidth: '48px' }}>{time}</span>
+      <span style={{
+        padding: '1px 6px', borderRadius: '2px', fontSize: '10px', fontWeight: 500,
+        minWidth: '32px', textAlign: 'center',
+        background: s.tagBg, color: s.tagColor,
+      }}>{tag}</span>
+      <span style={{ color: '#64748b', flex: 1 }}>{msg}</span>
+    </div>
+  );
+};
+
+/** Matches .kpi with two-line numeric + sub */
+const KpiCard: React.FC<{ label: string; value: string; sub?: string; color?: string }> = ({
+  label, value, sub, color = '#4ade80',
+}) => (
+  <div style={styles.kpi}>
+    <div style={styles.kpiLabel}>{label}</div>
+    <div style={{ ...styles.kpiNum, color }}>{value}</div>
+    {sub && <div style={{ fontSize: '10px', color: '#4ade80', marginTop: '2px' }}>{sub}</div>}
   </div>
 );
 
-const SectionHeading: React.FC<{ children: React.ReactNode }> = ({ children }) => (
-  <div className="text-xs font-semibold uppercase tracking-wider text-text-light-secondary dark:text-text-dark-secondary mb-2 mt-4 first:mt-0">
+/** Matches the section divider labels in the HTML */
+const SectionLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <div style={{
+    fontSize: '10px', fontWeight: 700, letterSpacing: '0.15em',
+    color: '#475569', textTransform: 'uppercase',
+    margin: '12px 0 8px',
+  }}>
     {children}
   </div>
 );
@@ -93,7 +194,6 @@ interface AlertsPanelProps {
 // ── Main Component ────────────────────────────────────────────────────────────
 const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
   const [tab, setTab] = useState<ReportTab>('alerts');
-
   const [logs, setLogs] = useState<BackendLog[]>([]);
   const [kpi, setKpi] = useState<DerivedKpi | null>(null);
   const [loadingReport, setLoadingReport] = useState(false);
@@ -110,35 +210,23 @@ const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
         fetch(`${BACKEND_URL}/logs?limit=50`),
         fetch(`${BACKEND_URL}/system-status`),
       ]);
-
       if (!logsRes.ok) throw new Error(`Logs fetch failed: HTTP ${logsRes.status}`);
       const logsJson = await logsRes.json();
       const fetchedLogs: BackendLog[] = Array.isArray(logsJson.logs) ? logsJson.logs : [];
       setLogs(fetchedLogs);
 
-      // system-status → { station_1: {...}, station_2: {...} }
       if (statusRes.ok) {
         const statusJson = await statusRes.json();
-        // Object.values gives us the per-station entries
         const entries = Object.values(statusJson) as SystemStatusEntry[];
-
         if (entries.length > 0) {
-          const signals = entries
-            .map(e => safeNum(e.signal_dbm))
-            .filter(s => s !== 0);                          // exclude missing/zero
-          const avgSignal =
-            signals.length > 0
-              ? signals.reduce((a, b) => a + b, 0) / signals.length
-              : -65;
-
-          const onlineCount = entries.filter(e => e.status === 'ONLINE').length;
-
+          const signals = entries.map(e => safeNum(e.signal_dbm)).filter(s => s !== 0);
+          const avgSignal = signals.length > 0 ? signals.reduce((a, b) => a + b, 0) / signals.length : -65;
           setKpi({
-            avg_signal_dbm:    avgSignal,
-            online_count:      onlineCount,
-            total_count:       entries.length,
+            avg_signal_dbm: avgSignal,
+            online_count: entries.filter(e => e.status === 'ONLINE').length,
+            total_count: entries.length,
             downtime_reduction: 15.0,
-            power_usage_w:      48.5,
+            power_usage_w: 48.5,
           });
         }
       }
@@ -157,10 +245,7 @@ const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
   const exportAlertsCSV = () => {
     const headers = 'ID,Timestamp,Severity,Message\n';
     const csvContent = alerts
-      .map(
-        a =>
-          `${a.id},${a.timestamp},${a.severity},"${a.message.replace(/"/g, '""')}"`
-      )
+      .map(a => `${a.id},${a.timestamp},${a.severity},"${a.message.replace(/"/g, '""')}"`)
       .join('\n');
     const blob = new Blob([headers + csvContent], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
@@ -193,9 +278,7 @@ const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
       URL.revokeObjectURL(url);
       setDownloadMsg('Report downloaded successfully.');
     } catch (e) {
-      setDownloadMsg(
-        `Download failed: ${e instanceof Error ? e.message : 'Unknown error'}`
-      );
+      setDownloadMsg(`Download failed: ${e instanceof Error ? e.message : 'Unknown error'}`);
     } finally {
       setDownloading(false);
       setTimeout(() => setDownloadMsg(null), 4000);
@@ -210,39 +293,34 @@ const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <Card className="flex flex-col">
+    <div style={styles.card}>
 
-      {/* Header */}
-      <CardHeader>
-        <CardTitle>Alerts &amp; Reports</CardTitle>
-        <div className="flex items-center gap-2">
-          <div className="flex rounded overflow-hidden border border-border-light dark:border-border-dark text-xs">
-            <button
-              onClick={() => setTab('alerts')}
-              className={`px-3 py-1 transition-colors ${
-                tab === 'alerts'
-                  ? 'bg-accent-blue text-white'
-                  : 'bg-transparent text-text-light-secondary dark:text-text-dark-secondary hover:bg-bg-light-secondary dark:hover:bg-bg-dark-secondary'
-              }`}
-            >
-              Alerts
-            </button>
-            <button
-              onClick={() => setTab('report')}
-              className={`px-3 py-1 transition-colors ${
-                tab === 'report'
-                  ? 'bg-accent-blue text-white'
-                  : 'bg-transparent text-text-light-secondary dark:text-text-dark-secondary hover:bg-bg-light-secondary dark:hover:bg-bg-dark-secondary'
-              }`}
-            >
-              Report
-            </button>
+      {/* ── Header row ── */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+        <div style={styles.cardTitle}>Alerts &amp; Reports</div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {/* Tab toggle — matches .mode-toggle */}
+          <div style={{ display: 'flex', border: '1px solid #1e2a4a', borderRadius: '3px', overflow: 'hidden' }}>
+            {(['alerts', 'report'] as ReportTab[]).map(t => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                style={{
+                  ...styles.modeBtn,
+                  background: tab === t ? '#1d4ed8' : 'transparent',
+                  color: tab === t ? '#fff' : '#334155',
+                }}
+              >
+                {t === 'alerts' ? 'Alerts' : 'Report'}
+              </button>
+            ))}
           </div>
 
           {tab === 'alerts' && (
             <button
               onClick={exportAlertsCSV}
-              className="text-xs bg-bg-light-secondary dark:bg-bg-dark-secondary hover:opacity-80 px-2 py-1 rounded"
+              style={{ ...styles.btn, ...styles.btnActive, fontSize: '10px', padding: '5px 12px' }}
             >
               Export CSV
             </button>
@@ -251,35 +329,34 @@ const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
             <button
               onClick={fetchReportData}
               disabled={loadingReport}
-              className="text-xs bg-bg-light-secondary dark:bg-bg-dark-secondary hover:opacity-80 px-2 py-1 rounded disabled:opacity-40"
+              style={{ ...styles.btn, ...styles.btnManual, fontSize: '10px', padding: '5px 12px', opacity: loadingReport ? 0.5 : 1 }}
             >
               {loadingReport ? 'Refreshing…' : 'Refresh'}
             </button>
           )}
         </div>
-      </CardHeader>
+      </div>
 
       {/* ══ ALERTS TAB ══ */}
       {tab === 'alerts' && (
-        <div className="overflow-y-auto h-64 pr-2 space-y-2">
+        <div style={{ maxHeight: '260px', overflowY: 'auto' }}>
           {alerts.length === 0 ? (
-            <div className="text-xs italic text-center text-text-light-secondary dark:text-text-dark-secondary pt-8">
+            <div style={{ ...styles.mono, fontSize: '11px', color: '#475569', textAlign: 'center', padding: '20px 0', fontStyle: 'italic' }}>
               No alerts
             </div>
           ) : (
             alerts.map(alert => {
-              const style = severityStyle(alert.severity as AlertSeverity);
+              const sev = levelToSeverity(alert.severity);
+              const s = severityStyles[sev];
+              const time = alert.timestamp?.slice(11, 16) ?? '—';
               return (
-                <div
+                <LogEntry
                   key={alert.id}
-                  className={`p-2 rounded-md flex items-start ${style.bg} ${style.text}`}
-                >
-                  <div className="flex-shrink-0 w-16 text-xs opacity-80">{alert.timestamp}</div>
-                  <div className="flex-grow pl-2 border-l border-current border-opacity-30">
-                    <span className="font-bold text-xs uppercase mr-2">[{alert.severity}]</span>
-                    <span className="text-sm">{alert.message}</span>
-                  </div>
-                </div>
+                  time={time}
+                  tag={s.label}
+                  severity={sev}
+                  msg={alert.message}
+                />
               );
             })
           )}
@@ -288,148 +365,151 @@ const AlertsPanel: React.FC<AlertsPanelProps> = ({ alerts }) => {
 
       {/* ══ REPORT TAB ══ */}
       {tab === 'report' && (
-        <div className="overflow-y-auto h-64 pr-1">
+        <div style={{ maxHeight: '260px', overflowY: 'auto', paddingRight: '4px' }}>
 
-          {/* Error */}
           {reportError && (
-            <div className="text-xs text-accent-red p-2 bg-red-50 dark:bg-red-900/20 rounded mt-1">
+            <div style={{ ...styles.mono, fontSize: '11px', color: '#f87171', background: '#1f0a0a', padding: '8px 10px', borderRadius: '3px', marginBottom: '8px' }}>
               {reportError}
             </div>
           )}
 
-          {/* Loading */}
           {loadingReport && !reportError && (
-            <div className="text-xs italic text-center text-text-light-secondary dark:text-text-dark-secondary pt-8">
+            <div style={{ ...styles.mono, fontSize: '11px', color: '#475569', textAlign: 'center', padding: '20px 0', fontStyle: 'italic' }}>
               Loading report data…
             </div>
           )}
 
           {!loadingReport && !reportError && (
-            <div className="space-y-1">
-
-              {/* KPI highlights */}
+            <>
+              {/* KPI grid */}
               {kpi && (
                 <>
-                  <SectionHeading>Live KPI Snapshot</SectionHeading>
-                  <div className="grid grid-cols-2 gap-2">
+                  <SectionLabel>Live KPI Snapshot</SectionLabel>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                     <KpiCard
-                      label="Avg Signal"
+                      label="Avg signal"
                       value={`${fmt(kpi.avg_signal_dbm)} dBm`}
-                      sub="across all stations"
-                      color={kpi.avg_signal_dbm > -70 ? 'text-accent-green' : 'text-accent-yellow'}
+                      sub={kpi.avg_signal_dbm > -70 ? 'good' : 'marginal'}
+                      color={kpi.avg_signal_dbm > -70 ? '#4ade80' : '#fbbf24'}
                     />
                     <KpiCard
-                      label="Stations Online"
+                      label="Stations online"
                       value={`${kpi.online_count} / ${kpi.total_count}`}
                       sub="heartbeat confirmed"
-                      color={kpi.online_count === kpi.total_count ? 'text-accent-green' : 'text-accent-yellow'}
+                      color={kpi.online_count === kpi.total_count ? '#4ade80' : '#fbbf24'}
                     />
                     <KpiCard
-                      label="Manual Realignments"
+                      label="Manual realignments"
                       value={String(manualCmds.length)}
-                      sub="logged this session"
-                      color="text-accent-blue"
+                      sub="this session"
+                      color="#60a5fa"
                     />
                     <KpiCard
-                      label="Power Draw"
+                      label="Power draw"
                       value={`${fmt(kpi.power_usage_w)} W`}
                       sub="last snapshot"
-                      color="text-accent-yellow"
+                      color="#fbbf24"
                     />
                   </div>
                 </>
               )}
 
-              {/* Log summary badges */}
-              <SectionHeading>Log Highlights</SectionHeading>
-              <div className="grid grid-cols-3 gap-2 text-center">
-                <div className="rounded-lg bg-bg-light-secondary dark:bg-bg-dark-secondary p-2">
-                  <div className="text-lg font-bold text-accent-red">{errorLogs.length}</div>
-                  <div className="text-[10px] text-text-light-secondary dark:text-text-dark-secondary">Errors</div>
-                </div>
-                <div className="rounded-lg bg-bg-light-secondary dark:bg-bg-dark-secondary p-2">
-                  <div className="text-lg font-bold text-accent-yellow">{warnLogs.length}</div>
-                  <div className="text-[10px] text-text-light-secondary dark:text-text-dark-secondary">Warnings</div>
-                </div>
-                <div className="rounded-lg bg-bg-light-secondary dark:bg-bg-dark-secondary p-2">
-                  <div className="text-lg font-bold text-accent-green">{infoCount}</div>
-                  <div className="text-[10px] text-text-light-secondary dark:text-text-dark-secondary">Info</div>
-                </div>
+              {/* Log summary */}
+              <SectionLabel>Log Highlights</SectionLabel>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', textAlign: 'center' }}>
+                {[
+                  { count: errorLogs.length,  color: '#f87171', label: 'Errors'   },
+                  { count: warnLogs.length,   color: '#fbbf24', label: 'Warnings' },
+                  { count: Math.max(0, infoCount), color: '#4ade80', label: 'Info' },
+                ].map(({ count, color, label }) => (
+                  <div key={label} style={styles.kpi}>
+                    <div style={{ ...styles.mono, fontSize: '22px', fontWeight: 500, color }}>{count}</div>
+                    <div style={{ fontSize: '10px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: '2px' }}>{label}</div>
+                  </div>
+                ))}
               </div>
 
-              {/* Recent backend logs */}
-              <SectionHeading>Recent System Logs</SectionHeading>
-              <div className="space-y-1">
+              {/* Recent log entries */}
+              <SectionLabel>Recent System Logs</SectionLabel>
+              <div>
                 {logs.length === 0 ? (
-                  <div className="text-xs italic text-center text-text-light-secondary dark:text-text-dark-secondary">
-                    No logs available
-                  </div>
+                  <div style={{ ...styles.mono, fontSize: '11px', color: '#475569', fontStyle: 'italic' }}>No logs available</div>
                 ) : (
                   logs.slice(0, 8).map((log, i) => {
                     const sev = levelToSeverity(log.level);
-                    const style = severityStyle(sev);
+                    const s = severityStyles[sev];
                     return (
-                      <div
+                      <LogEntry
                         key={i}
-                        className={`text-xs flex items-start gap-2 rounded px-2 py-1 ${style.bg} ${style.text}`}
-                      >
-                        <span className="opacity-60 shrink-0 w-28 truncate">
-                          {(log.ts ?? '').slice(0, 16)}
-                        </span>
-                        <span className="font-semibold shrink-0 w-20 truncate">
-                          {log.station_id ?? '—'}
-                        </span>
-                        <span className="truncate">{log.message ?? ''}</span>
-                      </div>
+                        time={(log.ts ?? '').slice(11, 16)}
+                        tag={s.label}
+                        severity={sev}
+                        msg={`[${log.station_id ?? '—'}] ${log.message ?? ''}`}
+                      />
                     );
                   })
                 )}
               </div>
 
               {/* PDF download */}
-              <SectionHeading>Full Report</SectionHeading>
-              <div className="flex flex-col gap-2 pb-2">
-                <p className="text-xs text-text-light-secondary dark:text-text-dark-secondary">
-                  The full PDF includes station status, environmental readings, KPI trends, and all system logs.
-                </p>
-                <button
-                  onClick={downloadPDF}
-                  disabled={downloading}
-                  className="w-full text-sm font-semibold bg-accent-blue hover:opacity-90 disabled:opacity-50 text-white rounded-lg py-2 transition-opacity flex items-center justify-center gap-2"
-                >
-                  {downloading ? (
-                    <>
-                      <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-                      </svg>
-                      Generating…
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M12 15V3m0 12l-4-4m4 4l4-4M2 17v2a2 2 0 002 2h16a2 2 0 002-2v-2" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                      Download PDF Report
-                    </>
-                  )}
-                </button>
-                {downloadMsg && (
-                  <div
-                    className={`text-xs text-center ${
-                      downloadMsg.startsWith('Download failed') ? 'text-accent-red' : 'text-accent-green'
-                    }`}
-                  >
-                    {downloadMsg}
-                  </div>
+              <SectionLabel>Full Report</SectionLabel>
+              <p style={{ fontSize: '11px', color: '#475569', marginBottom: '8px', lineHeight: 1.5 }}>
+                Full PDF includes station status, environmental readings, KPI trends, and all system logs.
+              </p>
+              <button
+                onClick={downloadPDF}
+                disabled={downloading}
+                style={{
+                  ...styles.btn,
+                  width: '100%',
+                  background: downloading ? '#1e2a4a' : '#166534',
+                  color: downloading ? '#64748b' : '#4ade80',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  fontSize: '11px',
+                  padding: '8px 14px',
+                  opacity: downloading ? 0.6 : 1,
+                  transition: 'opacity 0.2s',
+                }}
+              >
+                {downloading ? (
+                  <>
+                    <svg style={{ animation: 'spin 1s linear infinite', width: '14px', height: '14px' }} viewBox="0 0 24 24" fill="none">
+                      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" opacity="0.25" />
+                      <path fill="currentColor" d="M4 12a8 8 0 018-8v8z" opacity="0.75" />
+                    </svg>
+                    Generating…
+                  </>
+                ) : (
+                  <>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 15V3m0 12l-4-4m4 4l4-4M2 17v2a2 2 0 002 2h16a2 2 0 002-2v-2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    Download PDF Report
+                  </>
                 )}
-              </div>
-
-            </div>
+              </button>
+              {downloadMsg && (
+                <div style={{
+                  ...styles.mono,
+                  fontSize: '10px',
+                  textAlign: 'center',
+                  marginTop: '6px',
+                  color: downloadMsg.startsWith('Download failed') ? '#f87171' : '#4ade80',
+                }}>
+                  {downloadMsg}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
-    </Card>
+
+      {/* Spin keyframes injected once */}
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
   );
 };
 

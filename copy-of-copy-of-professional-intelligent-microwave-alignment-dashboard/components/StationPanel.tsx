@@ -1,10 +1,251 @@
-
 import React, { useState, useEffect } from 'react';
 import { StationData, OperationalMode } from '../types';
-import Card, { CardHeader, CardTitle } from './common/Card';
-import Gauge from './Gauge';
-import { stat } from 'fs';
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   Style injection — mirrors the HTML dashboard's CSS exactly
+───────────────────────────────────────────────────────────────────────────── */
+const STYLES = `
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;500;700&display=swap');
+
+  .ma-card {
+    font-family: 'Syne', sans-serif;
+    background: #0d1224;
+    border: 1px solid #1e2a4a;
+    border-radius: 6px;
+    padding: 14px;
+    color: #e2e8f0;
+  }
+
+  /* ── header ── */
+  .ma-station-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .ma-station-name {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: #e2e8f0;
+  }
+  .ma-header-right { display: flex; align-items: center; gap: 10px; }
+
+  /* ── RSSI value ── */
+  .ma-rssi-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 22px;
+    font-weight: 500;
+  }
+  .ma-rssi-good { color: #4ade80; }
+  .ma-rssi-warn { color: #fbbf24; }
+  .ma-rssi-bad  { color: #f87171; }
+  .ma-rssi-none { color: #475569; }
+
+  /* ── badge ── */
+  .ma-badge {
+    font-family: 'Syne', sans-serif;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 3px;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    display: inline-flex;
+    align-items: center;
+  }
+  .ma-badge-on  { background: #0f2a1a; color: #4ade80; border: 1px solid #166534; }
+  .ma-badge-off { background: #1f0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+  .ma-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    display: inline-block; margin-right: 5px;
+  }
+  .ma-dot-on  { background: #4ade80; }
+  .ma-dot-off { background: #f87171; }
+
+  /* ── angle gauges ── */
+  .ma-gauge-row { display: flex; gap: 16px; margin-bottom: 14px; }
+  .ma-gauge-wrap { flex: 1; text-align: center; }
+  .ma-gauge-label {
+    font-size: 10px; color: #64748b;
+    letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 6px;
+  }
+  .ma-gauge-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 18px; font-weight: 500; color: #60a5fa; margin-bottom: 4px;
+  }
+  .ma-angle-bar-bg  { height: 5px; background: #1e2a4a; border-radius: 2px; overflow: hidden; }
+  .ma-angle-bar-fill { height: 100%; background: #2563eb; border-radius: 2px; transition: width 0.4s ease; }
+  .ma-sep { width: 1px; background: #1e2a4a; align-self: stretch; }
+
+  /* ── sliders ── */
+  .ma-slider-row { margin-bottom: 10px; }
+  .ma-slider-label {
+    font-size: 10px; color: #475569; letter-spacing: 0.08em;
+    text-transform: uppercase; margin-bottom: 5px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .ma-slider-val { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #60a5fa; }
+  .ma-slider {
+    width: 100%;
+    accent-color: #2563eb;
+    cursor: pointer;
+  }
+  .ma-slider:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  /* ── signal bar ── */
+  .ma-sig-bar-bg { height: 4px; background: #1e2a4a; border-radius: 2px; overflow: hidden; margin: 10px 0 14px; }
+  .ma-sig-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+
+  /* ── pending banner ── */
+  .ma-pending {
+    background: #0c1a3a;
+    border: 1px solid #1d4ed8;
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    color: #60a5fa;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    animation: ma-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes ma-pulse { 0%,100%{opacity:1} 50%{opacity:0.55} }
+  .ma-spinner {
+    width: 14px; height: 14px;
+    border: 2px solid #2563eb;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: ma-spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes ma-spin { to { transform: rotate(360deg); } }
+
+  /* ── error box ── */
+  .ma-error-box {
+    background: #1f0a0a;
+    border: 1px solid #7f1d1d;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .ma-error-text { font-size: 11px; color: #f87171; }
+  .ma-error-label { font-weight: 700; margin-right: 4px; }
+  .ma-btn-reset {
+    font-family: 'Syne', sans-serif;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+    padding: 4px 10px; border-radius: 3px; border: none; cursor: pointer;
+    text-transform: uppercase;
+    background: #7f1d1d; color: #f87171;
+    transition: opacity 0.15s;
+  }
+  .ma-btn-reset:hover { opacity: 0.8; }
+
+  /* ── mode toggle ── */
+  .ma-mode-toggle {
+    display: flex;
+    border: 1px solid #1e2a4a;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .ma-mode-btn {
+    font-family: 'Syne', sans-serif;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+    padding: 5px 14px; cursor: pointer; text-transform: uppercase;
+    border: none; flex: 1; text-align: center; transition: background 0.15s, color 0.15s;
+  }
+  .ma-mode-btn:disabled { cursor: not-allowed; }
+  .ma-mode-on  { background: #1d4ed8; color: #fff; }
+  .ma-mode-off { background: transparent; color: #334155; }
+  .ma-mode-off:not(:disabled):hover { color: #64748b; }
+
+  /* ── bottom row ── */
+  .ma-bottom-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .ma-meta-label {
+    font-size: 10px; color: #475569; text-transform: uppercase;
+    letter-spacing: 0.08em; margin-bottom: 4px;
+  }
+  .ma-lqi-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 20px; font-weight: 500; color: #4ade80;
+  }
+  .ma-status-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px; color: #94a3b8;
+  }
+`;
+
+function injectStyles() {
+  if (typeof document !== 'undefined' && !document.getElementById('ma-station-styles')) {
+    const el = document.createElement('style');
+    el.id = 'ma-station-styles';
+    el.textContent = STYLES;
+    document.head.appendChild(el);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Helpers
+───────────────────────────────────────────────────────────────────────────── */
+
+/** True when the backend has sent a real reading (anything above the -99 sentinel). */
+function hasSignal(rssi: number) {
+  return rssi > -99;
+}
+
+function rssiClass(rssi: number) {
+  if (!hasSignal(rssi)) return 'ma-rssi-none';
+  if (rssi > -50) return 'ma-rssi-good';
+  if (rssi > -65) return 'ma-rssi-warn';
+  return 'ma-rssi-bad';
+}
+
+function rssiBarColor(rssi: number) {
+  if (!hasSignal(rssi)) return '#1e2a4a';
+  if (rssi > -50) return '#4ade80';
+  if (rssi > -65) return '#fbbf24';
+  return '#f87171';
+}
+
+/** Maps -90 dBm → 0 %, -30 dBm → 100 %. Returns 0 when no reading. */
+function rssiPct(rssi: number) {
+  if (!hasSignal(rssi)) return 0;
+  return Math.max(0, Math.min(100, ((rssi - -90) / (-30 - -90)) * 100));
+}
+
+/** Link quality index: 0–100 derived from dBm. Shows "—" when no reading yet. */
+function lqiFromRssi(rssi: number): number | null {
+  if (!hasSignal(rssi)) return null;
+  return Math.min(100, Math.max(0, Math.round(110 + rssi)));
+}
+
+function azPct(az: number)  { return Math.min(100, Math.round((az / 180) * 100)); }
+function elPct(el: number)  { return Math.min(100, Math.round((el / 90)  * 100)); }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Default / fallback station shape
+───────────────────────────────────────────────────────────────────────────── */
+const DEFAULT_STATION: StationData = {
+  station_id: 'station_1',
+  mode: OperationalMode.AUTO,
+  connection: { last_heartbeat: '', online: false },
+  current_angles: { azimuth: 30, elevation: 30 },
+  target_angles: null,
+  command: { pending: false, issued_at: null, acknowledged: false },
+  error: { has_error: false, error_code: null, error_message: null, timestamp: null },
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Component
+───────────────────────────────────────────────────────────────────────────── */
 interface StationPanelProps {
   station: StationData;
   setMode: (mode: OperationalMode) => void;
@@ -12,209 +253,193 @@ interface StationPanelProps {
   resetError: (id: string) => void;
 }
 
-const getStatusColor = (mode: OperationalMode, online: boolean, hasError: boolean) => {
-  if (!online) return 'text-gray-400';
-  if (hasError || mode === OperationalMode.ERROR) return 'text-accent-red';
-  if (mode === OperationalMode.MAINT) return 'text-accent-yellow';
-  return 'text-accent-green';
-};
+const StationPanel: React.FC<StationPanelProps> = ({
+  station,
+  setMode,
+  sendManualCommand,
+  resetError,
+}) => {
+  injectStyles();
 
-const getRssiColor = (rssi?: number) => {
-  if (!rssi) return 'text-gray-400';
-  if (rssi > -50) return 'text-accent-green';
-  if (rssi > -65) return 'text-accent-yellow';
-  return 'text-accent-red';
-};
+  const s: StationData = station ?? DEFAULT_STATION;
 
-const StationPanel: React.FC<StationPanelProps> = ({ station, setMode, sendManualCommand, resetError }) => {
-  // Local state for dragging sliders (Rule: update visually while dragging, don't API until release)
-  
-
-  const localStation = station !== undefined ? station : {
-  station_id: "station_1",
-  mode: "AUTO",
-
-  connection: {
-    last_heartbeat: "2026-01-16T15:10:41.019501",
-    online: false
-  },
-
-  current_angles: {
-    azimuth: 30,
-    elevation: 30
-  },
-
-  target_angles: null,
-
-  command: {
-    pending: false,
-    issued_at: null,
-    acknowledged: false
-  },
-
-  error: {
-    has_error: false,
-    error_code: null,
-    error_message: null,
-    timestamp: null
-  }
-};
-  const [localAz, setLocalAz] = useState(station !== undefined ? station.current_angles.azimuth : 30);
-  const [localEl, setLocalEl] = useState(station !== undefined ? station.current_angles.elevation : 30);
+  const [localAz, setLocalAz] = useState(s.current_angles.azimuth);
+  const [localEl, setLocalEl] = useState(s.current_angles.elevation);
   const [isDragging, setIsDragging] = useState(false);
 
-  // Sync with backend when not dragging
+  /* Sync angles from backend when user isn't dragging */
   useEffect(() => {
     if (!isDragging) {
-      setLocalAz(localStation.current_angles.azimuth);
-      setLocalEl(localStation.current_angles.elevation);
+      setLocalAz(s.current_angles.azimuth);
+      setLocalEl(s.current_angles.elevation);
     }
-  }, [localStation.current_angles, isDragging]);
+  }, [s.current_angles, isDragging]);
 
-  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>, type: 'azimuth' | 'elevation') => {
-    if (type === 'azimuth') setLocalAz(parseFloat(e.target.value));
-    else setLocalEl(parseFloat(e.target.value));
-  };
-
-  const handleRelease = () => {
+  function handleRelease() {
     setIsDragging(false);
-    sendManualCommand(localStation.station_id, localAz, localEl);
-  };
+    sendManualCommand(s.station_id, localAz, localEl);
+  }
 
-  const rssi = localStation.telemetry?.rssi || -45;
-  const rssiPercentage = ((rssi - -90) / (-30 - -90)) * 100;
-  const isControlsDisabled = !localStation.connection.online || 
-                             localStation.mode !== OperationalMode.MANUAL || 
-                             localStation.command.pending || 
-                             localStation.error.has_error;
+  /*
+   * RSSI source priority:
+   *   1. s.signal_dbm  — live value pushed by ESP32 heartbeat (backend v2)
+   *   2. -99           — sentinel meaning "no reading yet"; shown as N/A
+   *
+   * The old fallback `(s as any).telemetry?.rssi ?? -48` is removed because
+   * it silently masked missing data with a plausible-looking fake value.
+   */
+  const rssi: number = (s as any).signal_dbm ?? -99;
+
+  const online   = s.connection.online;
+  const hasError = s.error.has_error;
+  const pending  = s.command.pending;
+  const isManual = s.mode === OperationalMode.MANUAL;
+  const disabled = !online || !isManual || pending || hasError;
+  const lqi      = lqiFromRssi(rssi);
+  const displayName = s.station_id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{localStation.station_id.replace('_', ' ').toUpperCase()}</CardTitle>
-        <div className="flex items-center space-x-4">
-          <div className={`flex items-center text-sm font-bold ${getStatusColor(localStation.mode, localStation.connection.online, localStation.error.has_error)}`}>
-            <span className={`w-2 h-2 rounded-full mr-2 ${getStatusColor(localStation.mode, localStation.connection.online, localStation.error.has_error).replace('text-', 'bg-')}`}></span>
-            {localStation.connection.online ? localStation.mode : 'OFFLINE'}
-          </div>
-          <div className={`font-bold text-lg ${getRssiColor(rssi)}`}>
-            {rssi.toFixed(1)} dBm
+    <div className="ma-card">
+
+      {/* ── Header ───────────────────────────────────────────────────────── */}
+      <div className="ma-station-header">
+        <span className="ma-station-name">{displayName}</span>
+        <div className="ma-header-right">
+          <span className={`ma-rssi-val ${rssiClass(rssi)}`}>
+            {hasSignal(rssi) ? `${rssi.toFixed(1)} dBm` : 'N/A'}
+          </span>
+          <span className={`ma-badge ${online ? 'ma-badge-on' : 'ma-badge-off'}`}>
+            <span className={`ma-dot ${online ? 'ma-dot-on' : 'ma-dot-off'}`} />
+            {online ? 'Online' : 'Offline'}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Azimuth / Elevation gauge bars ──────────────────────────────── */}
+      <div className="ma-gauge-row">
+        <div className="ma-gauge-wrap">
+          <div className="ma-gauge-label">Azimuth</div>
+          <div className="ma-gauge-val">{localAz.toFixed(1)}°</div>
+          <div className="ma-angle-bar-bg">
+            <div className="ma-angle-bar-fill" style={{ width: `${azPct(localAz)}%` }} />
           </div>
         </div>
-      </CardHeader>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Gauges */}
-        <div className="col-span-1 md:col-span-2 grid grid-cols-2 gap-4">
-          <div className="h-32">
-            <Gauge label="Azimuth" value={localAz} max={170} unit="°" isCompass={true} />
-          </div>
-          <div className="h-32">
-            <Gauge label="Elevation" value={localEl} max={170} unit="°" />
-          </div>
-        </div>
-
-        {/* Sliders Area */}
-        <div className="col-span-1 md:col-span-2 mt-2 space-y-3">
-          <div className="w-full relative">
-            <label className="text-xs font-semibold text-text-light-secondary dark:text-text-dark-secondary flex justify-between">
-              Azimuth Adjust <span>{localAz.toFixed(1)}°</span>
-            </label>
-            <input
-              type="range"
-              min="0"
-              max="180"
-              step="0.1"
-              disabled={isControlsDisabled}
-              value={localAz}
-              onMouseDown={() => setIsDragging(true)}
-              onTouchStart={() => setIsDragging(true)}
-              onChange={(e) => handleSliderChange(e, 'azimuth')}
-              onMouseUp={handleRelease}
-              onTouchEnd={handleRelease}
-              className={`w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700 ${isControlsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-            />
-          </div>
-
-          <div className="w-full relative">
-            <label className="text-xs font-semibold text-text-light-secondary dark:text-text-dark-secondary flex justify-between">
-              Elevation Adjust <span>{localEl.toFixed(1)}°</span>
-            </label>
-            <input
-              type="range"
-              min="0"
-              max="180"
-              step="0.1"
-              disabled={isControlsDisabled}
-              value={localEl}
-              onMouseDown={() => setIsDragging(true)}
-              onTouchStart={() => setIsDragging(true)}
-              onChange={(e) => handleSliderChange(e, 'elevation')}
-              onMouseUp={handleRelease}
-              onTouchEnd={handleRelease}
-              className={`w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700 ${isControlsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-            />
-          </div>
-
-          {/* Pending State Banner */}
-          {localStation.command.pending && (
-            <div className="bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 text-xs p-2 rounded flex items-center justify-between animate-pulse">
-              <span>Command in-flight to target: {localStation.target_angles?.azimuth.toFixed(1)}°, {localStation.target_angles?.elevation.toFixed(1)}°</span>
-              <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div>
-            </div>
-          )}
-
-          {/* Signal Indicator */}
-          <div>
-            <div className="w-full bg-gray-200 rounded-full h-1.5 dark:bg-gray-700 mt-2">
-              <div
-                className="bg-accent-blue h-1.5 rounded-full"
-                style={{ width: `${rssiPercentage}%`, transition: 'width 0.5s ease' }}
-              ></div>
-            </div>
-          </div>
-        </div>
-
-        {/* Mode & Error Controls */}
-        <div className="col-span-1 md:col-span-2 space-y-2">
-          {localStation.error.has_error && (
-            <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 rounded-lg flex items-center justify-between">
-              <div className="text-xs text-red-600 dark:text-red-400">
-                <span className="font-bold">FAULT DETECTED:</span> {localStation.error.message || 'Mechanical failure'}
-              </div>
-              <button 
-                onClick={() => resetError(localStation.station_id)}
-                className="bg-red-600 hover:bg-red-700 text-white text-[10px] px-2 py-1 rounded font-bold transition-colors"
-              >
-                RESET
-              </button>
-            </div>
-          )}
-
-          <div className="bg-gray-50 dark:bg-gray-900/50 p-3 rounded-lg border border-gray-100 dark:border-gray-800">
-            <h3 className="font-semibold mb-2 text-xs text-text-light-secondary dark:text-text-dark-secondary">
-              Governance Protocol
-            </h3>
-            <div className="flex space-x-2">
-              {[OperationalMode.AUTO, OperationalMode.MANUAL].map((m) => (
-                <button
-                  key={m}
-                  onClick={() => setMode(m)}
-                  disabled={!localStation.connection.online || localStation.mode === OperationalMode.ERROR}
-                  className={`flex-1 py-1 px-2 text-xs font-bold rounded-md transition-all ${
-                    localStation.mode === m
-                      ? 'bg-accent-blue text-white shadow-md scale-105'
-                      : 'bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-30'
-                  }`}
-                >
-                  {m}
-                </button>
-              ))}
-            </div>
+        <div className="ma-sep" />
+        <div className="ma-gauge-wrap">
+          <div className="ma-gauge-label">Elevation</div>
+          <div className="ma-gauge-val">{localEl.toFixed(1)}°</div>
+          <div className="ma-angle-bar-bg">
+            <div className="ma-angle-bar-fill" style={{ width: `${elPct(localEl)}%` }} />
           </div>
         </div>
       </div>
-    </Card>
+
+      {/* ── Error banner ─────────────────────────────────────────────────── */}
+      {hasError && (
+        <div className="ma-error-box">
+          <span className="ma-error-text">
+            <span className="ma-error-label">FAULT DETECTED:</span>
+            {(s.error as any).error_message ?? (s.error as any).message ?? 'Mechanical failure'}
+          </span>
+          <button className="ma-btn-reset" onClick={() => resetError(s.station_id)}>
+            Reset
+          </button>
+        </div>
+      )}
+
+      {/* ── Pending command banner ───────────────────────────────────────── */}
+      {pending && (
+        <div className="ma-pending">
+          <span>
+            Command in-flight → {s.target_angles?.azimuth.toFixed(1)}° / {s.target_angles?.elevation.toFixed(1)}°
+          </span>
+          <div className="ma-spinner" />
+        </div>
+      )}
+
+      {/* ── Manual sliders ───────────────────────────────────────────────── */}
+      <div className="ma-slider-row">
+        <div className="ma-slider-label">
+          <span>Az</span>
+          <span className="ma-slider-val">{localAz.toFixed(1)}°</span>
+        </div>
+        <input
+          type="range" min={0} max={180} step={0.1}
+          value={localAz} disabled={disabled}
+          className="ma-slider"
+          onMouseDown={() => setIsDragging(true)}
+          onTouchStart={() => setIsDragging(true)}
+          onChange={e => setLocalAz(parseFloat(e.target.value))}
+          onMouseUp={handleRelease}
+          onTouchEnd={handleRelease}
+        />
+      </div>
+      <div className="ma-slider-row">
+        <div className="ma-slider-label">
+          <span>El</span>
+          <span className="ma-slider-val">{localEl.toFixed(1)}°</span>
+        </div>
+        <input
+          type="range" min={0} max={180} step={0.1}
+          value={localEl} disabled={disabled}
+          className="ma-slider"
+          onMouseDown={() => setIsDragging(true)}
+          onTouchStart={() => setIsDragging(true)}
+          onChange={e => setLocalEl(parseFloat(e.target.value))}
+          onMouseUp={handleRelease}
+          onTouchEnd={handleRelease}
+        />
+      </div>
+
+      {/* ── RSSI signal bar ──────────────────────────────────────────────── */}
+      <div className="ma-sig-bar-bg">
+        <div
+          className="ma-sig-bar-fill"
+          style={{ width: `${rssiPct(rssi)}%`, background: rssiBarColor(rssi) }}
+        />
+      </div>
+
+      {/* ── Bottom row: Mode toggle · LQI · Status ───────────────────────── */}
+      <div className="ma-bottom-row">
+
+        <div>
+          <div className="ma-meta-label">Mode</div>
+          <div className="ma-mode-toggle" style={{ marginTop: 4 }}>
+            {[OperationalMode.AUTO, OperationalMode.MANUAL].map(m => (
+              <button
+                key={m}
+                className={`ma-mode-btn ${s.mode === m ? 'ma-mode-on' : 'ma-mode-off'}`}
+                disabled={!online || hasError}
+                onClick={() => setMode(m)}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ textAlign: 'center' }}>
+          <div className="ma-meta-label">Link quality</div>
+          <div className="ma-lqi-val" style={{ color: lqi === null ? '#475569' : '#4ade80' }}>
+            {lqi !== null ? lqi : '—'}
+          </div>
+        </div>
+
+        <div style={{ textAlign: 'right' }}>
+          <div className="ma-meta-label">Uptime</div>
+          <div className="ma-status-val">
+            {hasError ? (
+              <span style={{ color: '#f87171' }}>Fault</span>
+            ) : online ? (
+              <span style={{ color: '#4ade80' }}>Running</span>
+            ) : (
+              <span style={{ color: '#64748b' }}>Offline</span>
+            )}
+          </div>
+        </div>
+
+      </div>
+    </div>
   );
 };
 

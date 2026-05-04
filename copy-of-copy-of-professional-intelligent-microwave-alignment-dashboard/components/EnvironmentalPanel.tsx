@@ -1,6 +1,4 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import Card, { CardHeader, CardTitle } from './common/Card';
-import { Icon } from './common/Icon';
 
 // ── Types matching your backend's WeatherData model ──────────────────────────
 interface WeatherData {
@@ -22,52 +20,158 @@ interface EnvironmentalResponse {
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:8000';
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // match backend's 5-min auto-refresh
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
-// ── Sub-components ───────────────────────────────────────────────────────────
-const WeatherDataPoint: React.FC<{
-  icon: string;
-  label: string;
-  valueA: string;
-  valueB: string;
-  severity?: 'green' | 'yellow' | 'red';
-}> = ({ icon, label, valueA, valueB, severity = 'green' }) => {
-  const severityClasses = {
-    green: 'text-accent-green',
-    yellow: 'text-accent-yellow',
-    red: 'text-accent-red',
-  };
-  return (
-    <div className="flex items-center justify-between text-sm">
-      <div className="flex items-center">
-        <Icon name={icon} className={`w-5 h-5 mr-2 ${severityClasses[severity]}`} />
-        <span className="text-text-light-secondary dark:text-text-dark-secondary">{label}</span>
-      </div>
-      <div className="font-semibold text-right">
-        <span>{valueA}</span> / <span>{valueB}</span>
-      </div>
-    </div>
-  );
-};
+// ── Design tokens (mirror the HTML dashboard exactly) ─────────────────────────
+const styles = {
+  card: {
+    background: '#0d1224',
+    border: '1px solid #1e2a4a',
+    borderRadius: '6px',
+    padding: '14px',
+    fontFamily: "'Syne', sans-serif",
+  } as React.CSSProperties,
+
+  cardTitle: {
+    fontSize: '10px',
+    fontWeight: 700,
+    letterSpacing: '0.15em',
+    color: '#475569',
+    textTransform: 'uppercase' as const,
+    margin: '0 0 12px',
+  } as React.CSSProperties,
+
+  kpi: {
+    background: '#060b18',
+    borderRadius: '4px',
+    padding: '10px 12px',
+  } as React.CSSProperties,
+
+  kpiLabel: {
+    fontSize: '10px',
+    color: '#475569',
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    marginBottom: '4px',
+  } as React.CSSProperties,
+
+  kpiNum: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: '17px',
+    fontWeight: 500,
+    color: '#e2e8f0',
+  } as React.CSSProperties,
+
+  pill: {
+    background: '#060b18',
+    borderRadius: '4px',
+    padding: '8px 10px',
+    flex: 1,
+    textAlign: 'center' as const,
+  } as React.CSSProperties,
+
+  pillLabel: {
+    fontSize: '9px',
+    color: '#475569',
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.08em',
+    marginBottom: '3px',
+  } as React.CSSProperties,
+
+  pillVal: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: '14px',
+    fontWeight: 500,
+  } as React.CSSProperties,
+
+  barBg: {
+    height: '4px',
+    background: '#1e2a4a',
+    borderRadius: '2px',
+    overflow: 'hidden',
+    marginTop: '4px',
+  } as React.CSSProperties,
+
+  badgeOn: {
+    fontSize: '11px',
+    padding: '3px 10px',
+    borderRadius: '3px',
+    fontWeight: 500,
+    letterSpacing: '0.05em',
+    background: '#0f2a1a',
+    color: '#4ade80',
+    border: '1px solid #166534',
+  } as React.CSSProperties,
+
+  onlineDot: {
+    width: '7px',
+    height: '7px',
+    borderRadius: '50%',
+    background: '#4ade80',
+    display: 'inline-block',
+    marginRight: '5px',
+  } as React.CSSProperties,
+
+  mono: {
+    fontFamily: "'IBM Plex Mono', monospace",
+  } as React.CSSProperties,
+} as const;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-const getWindSeverity = (speed: number): 'green' | 'yellow' | 'red' => {
-  if (speed > 35) return 'red';
-  if (speed > 25) return 'yellow';
-  return 'green';
+const getWindColor = (speed: number): string => {
+  if (speed > 35) return '#f87171';
+  if (speed > 25) return '#fbbf24';
+  return '#4ade80';
+};
+
+const getRainColor = (rain: number): string => (rain > 5 ? '#f87171' : rain > 0 ? '#fbbf24' : '#4ade80');
+const getRainLabel = (rain: number): string => (rain === 0 ? 'None' : `${rain.toFixed(1)} mm/h`);
+
+const getImpact = (a: WeatherData, b: WeatherData) => {
+  const maxWind = Math.max(a.wind_speed, b.wind_speed);
+  const maxRain = Math.max(a.rain, b.rain);
+  const maxHum = Math.max(a.humidity, b.humidity);
+  if (maxRain > 5 || maxWind > 35) {
+    return {
+      impact: 'bad' as const,
+      label: 'HIGH',
+      msg: 'Rain detected — significant signal attenuation expected. High wind speed risks dish misalignment. Auto-realignment rate will increase.',
+      bg: '#1f0a0a', color: '#f87171', border: '#7f1d1d',
+    };
+  }
+  if (maxWind > 20 || maxHum > 80) {
+    return {
+      impact: 'warn' as const,
+      label: 'MODERATE',
+      msg: 'Rising humidity may cause mild rain fade. Wind gusts could introduce dish vibration — monitor alignment frequency.',
+      bg: '#231a05', color: '#fbbf24', border: '#854f0b',
+    };
+  }
+  return {
+    impact: 'good' as const,
+    label: 'LOW',
+    msg: 'Current conditions are favourable for microwave link operation. Low humidity and no precipitation — beam attenuation is minimal.',
+    bg: '#0a2018', color: '#4ade80', border: '#166534',
+  };
 };
 
 const fmt1 = (n: number) => n.toFixed(1);
 
-// ── Main Component ───────────────────────────────────────────────────────────
+// ── Bar fill ─────────────────────────────────────────────────────────────────
+const Bar: React.FC<{ pct: number; color: string }> = ({ pct, color }) => (
+  <div style={styles.barBg}>
+    <div style={{ height: '100%', width: `${Math.min(100, Math.max(0, pct))}%`, background: color, borderRadius: '2px' }} />
+  </div>
+);
+
+// ── Props ─────────────────────────────────────────────────────────────────────
 interface EnvironmentalPanelProps {
-  /** Optional: pass browser geolocation to get user-location weather too */
   userLat?: number;
   userLon?: number;
-  /** Override polling interval (ms). Defaults to 5 min. */
   refreshInterval?: number;
 }
 
+// ── Main Component ────────────────────────────────────────────────────────────
 const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
   userLat,
   userLon,
@@ -83,14 +187,9 @@ const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
       const res = await fetch(`${BACKEND_URL}/environmental-data`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lat: userLat ?? null,
-          lon: userLon ?? null,
-        }),
+        body: JSON.stringify({ lat: userLat ?? null, lon: userLon ?? null }),
       });
-
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-
       const json: EnvironmentalResponse = await res.json();
       setData(json);
       setError(null);
@@ -102,119 +201,233 @@ const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
     }
   }, [userLat, userLon]);
 
-  // Initial fetch + polling
   useEffect(() => {
     fetchEnvironmental();
     const interval = setInterval(fetchEnvironmental, refreshInterval);
     return () => clearInterval(interval);
   }, [fetchEnvironmental, refreshInterval]);
 
-  // ── Render: loading ────────────────────────────────────────────────────────
+  // ── Loading ───────────────────────────────────────────────────────────────
   if (loading) {
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Environmental</CardTitle>
-        </CardHeader>
-        <div className="p-4 text-xs italic text-center text-text-light-secondary dark:text-text-dark-secondary">
+      <div style={styles.card}>
+        <div style={styles.cardTitle}>Environmental</div>
+        <div style={{ ...styles.mono, fontSize: '11px', color: '#475569', textAlign: 'center', padding: '20px 0', fontStyle: 'italic' }}>
           Fetching weather data…
         </div>
-      </Card>
+      </div>
     );
   }
 
-  // ── Render: error ──────────────────────────────────────────────────────────
+  // ── Error ─────────────────────────────────────────────────────────────────
   if (error || !data) {
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Environmental</CardTitle>
-        </CardHeader>
-        <div className="p-4 text-xs text-center text-accent-red">
+      <div style={styles.card}>
+        <div style={styles.cardTitle}>Environmental</div>
+        <div style={{ fontSize: '11px', color: '#f87171', textAlign: 'center', padding: '20px 0' }}>
           {error ?? 'No data available'}
           <button
             onClick={fetchEnvironmental}
-            className="block mx-auto mt-2 text-xs underline text-text-light-secondary dark:text-text-dark-secondary"
+            style={{ display: 'block', margin: '8px auto 0', fontSize: '10px', color: '#475569', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', fontFamily: "'Syne', sans-serif" }}
           >
             Retry
           </button>
         </div>
-      </Card>
+      </div>
     );
   }
 
   const { station_a: a, station_b: b, user_location: u } = data;
+  const wx = getImpact(a, b);
   const maxWind = Math.max(a.wind_speed, b.wind_speed);
 
-  // ── Render: data ───────────────────────────────────────────────────────────
+  // ── Main render ───────────────────────────────────────────────────────────
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Environmental</CardTitle>
-        <div className="flex flex-col items-end gap-0.5">
-          <div className="text-xs text-text-light-secondary dark:text-text-dark-secondary">
-            STA A / STA B
-          </div>
-          {lastFetched && (
-            <div className="text-[10px] text-text-light-secondary dark:text-text-dark-secondary opacity-60">
-              Updated {lastFetched.toLocaleTimeString()}
-            </div>
-          )}
-        </div>
-      </CardHeader>
+    <div style={{ ...styles.card, border: '1px solid #1e3a5f' }}>
 
-      <div className="space-y-3">
-        <WeatherDataPoint
-          icon="temperature"
-          label="Temp"
-          valueA={`${fmt1(a.temperature)}°C`}
-          valueB={`${fmt1(b.temperature)}°C`}
-        />
-        <WeatherDataPoint
-          icon="wind"
-          label="Wind"
-          valueA={`${fmt1(a.wind_speed)} km/h`}
-          valueB={`${fmt1(b.wind_speed)} km/h`}
-          severity={getWindSeverity(maxWind)}
-        />
-        <WeatherDataPoint
-          icon="rain"
-          label="Rain"
-          valueA={`${fmt1(a.rain)} mm/h`}
-          valueB={`${fmt1(b.rain)} mm/h`}
-          severity={a.rain > 5 || b.rain > 5 ? 'yellow' : 'green'}
-        />
-        <WeatherDataPoint
-          icon="humidity"
-          label="Humidity"
-          valueA={`${Math.round(a.humidity)}%`}
-          valueB={`${Math.round(b.humidity)}%`}
-        />
-        <WeatherDataPoint
-          icon="pressure"
-          label="Pressure"
-          valueA={`${Math.round(a.pressure)} hPa`}
-          valueB={`${Math.round(b.pressure)} hPa`}
-        />
+      {/* ── Header ── */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          {/* Icon box */}
+          <div style={{ width: '28px', height: '28px', borderRadius: '4px', background: '#0c1a3a', border: '1px solid #1d4ed8', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="3" stroke="#60a5fa" strokeWidth="1.5" />
+              <line x1="8" y1="1" x2="8" y2="3" stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="8" y1="13" x2="8" y2="15" stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="1" y1="8" x2="3" y2="8" stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="13" y1="8" x2="15" y2="8" stroke="#60a5fa" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          </div>
+          <div>
+            <div style={{ fontSize: '13px', fontWeight: 700, color: '#e2e8f0', letterSpacing: '0.05em' }}>Weather station</div>
+            <div style={{ ...styles.mono, fontSize: '10px', color: '#475569' }}>
+              Live · {lastFetched ? lastFetched.toLocaleTimeString() : '—'}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          {/* Impact badge */}
+          <div style={{
+            fontSize: '11px', padding: '4px 12px', borderRadius: '3px',
+            fontWeight: 700, letterSpacing: '0.06em',
+            background: wx.bg, color: wx.color, border: `1px solid ${wx.border}`,
+          }}>
+            Link impact: {wx.label}
+          </div>
+          <span style={styles.badgeOn}>
+            <span style={styles.onlineDot} />Pi online
+          </span>
+        </div>
       </div>
 
-      {/* Optional: user location row */}
+      {/* ── Body grid ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '16px', alignItems: 'start' }}>
+
+        {/* Left: temp + conditions */}
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', background: '#060b18', borderRadius: '6px', padding: '14px 20px', minWidth: '110px' }}>
+          <div style={{ fontSize: '10px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>Temperature</div>
+          <div style={{ ...styles.mono, fontSize: '28px', fontWeight: 500, color: '#e2e8f0', lineHeight: 1 }}>
+            {fmt1((a.temperature + b.temperature) / 2)}
+          </div>
+          <div style={{ ...styles.mono, fontSize: '13px', color: '#64748b' }}>°C</div>
+
+          <div style={{ marginTop: '12px', fontSize: '10px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>Conditions</div>
+          <div style={{ fontSize: '12px', fontWeight: 700, color: '#60a5fa', textAlign: 'center' }}>
+            {wx.impact === 'bad' ? 'Overcast / wet' : wx.impact === 'warn' ? 'Warm / humid' : 'Clear / dry'}
+          </div>
+        </div>
+
+        {/* Right: pills + impact box */}
+        <div>
+
+          {/* Row 1: humidity, pressure, wind, wind dir */}
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Humidity</div>
+              <div style={{ ...styles.pillVal, color: '#60a5fa' }}>
+                {Math.round((a.humidity + b.humidity) / 2)}%
+              </div>
+              <Bar pct={(a.humidity + b.humidity) / 2} color="#2563eb" />
+            </div>
+
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Pressure</div>
+              <div style={{ ...styles.pillVal, color: '#94a3b8' }}>
+                {Math.round((a.pressure + b.pressure) / 2)} hPa
+              </div>
+              <Bar pct={((a.pressure + b.pressure) / 2 - 980) / 60 * 100} color="#475569" />
+            </div>
+
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Wind speed</div>
+              <div style={{ ...styles.pillVal, color: getWindColor(maxWind) }}>
+                {fmt1(maxWind)} km/h
+              </div>
+              <Bar pct={maxWind * 2} color="#854f0b" />
+            </div>
+
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Wind dir</div>
+              <div style={{ ...styles.pillVal, color: '#94a3b8' }}>—</div>
+              <div style={{ marginTop: '4px', display: 'flex', justifyContent: 'center' }}>
+                <svg width="24" height="24" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="10" stroke="#1e2a4a" strokeWidth="1" fill="none" />
+                  <polygon points="12,4 9,16 12,13 15,16" fill="#fbbf24" />
+                </svg>
+              </div>
+            </div>
+          </div>
+
+          {/* Row 2: rain, dew point, fade risk, multipath */}
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Rain</div>
+              <div style={{ ...styles.pillVal, color: getRainColor(Math.max(a.rain, b.rain)) }}>
+                {getRainLabel(Math.max(a.rain, b.rain))}
+              </div>
+            </div>
+
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Dew point</div>
+              <div style={{ ...styles.pillVal, color: '#94a3b8' }}>
+                {fmt1((a.temperature + b.temperature) / 2 - ((100 - (a.humidity + b.humidity) / 2) / 5))}°C
+              </div>
+            </div>
+
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Signal fade risk</div>
+              <div style={{ ...styles.pillVal, color: wx.impact === 'bad' ? '#f87171' : wx.impact === 'warn' ? '#fbbf24' : '#4ade80' }}>
+                {wx.impact === 'bad' ? 'High' : wx.impact === 'warn' ? 'Moderate' : 'Low'}
+              </div>
+            </div>
+
+            <div style={styles.pill}>
+              <div style={styles.pillLabel}>Multipath risk</div>
+              <div style={{ ...styles.pillVal, color: wx.impact === 'bad' ? '#f87171' : wx.impact === 'warn' ? '#fbbf24' : '#4ade80' }}>
+                {wx.impact === 'bad' ? 'High' : wx.impact === 'warn' ? 'Moderate' : 'Low'}
+              </div>
+            </div>
+          </div>
+
+          {/* Impact message box */}
+          <div style={{
+            borderLeft: `3px solid ${wx.border}`,
+            background: wx.bg,
+            color: wx.color,
+            padding: '8px 10px',
+            fontSize: '11px',
+            lineHeight: 1.5,
+            borderRadius: '0 3px 3px 0',
+          }}>
+            {wx.msg}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Station A / B detail KPIs ── */}
+      <div style={{ marginTop: '12px', borderTop: '1px solid #1e2a4a', paddingTop: '12px' }}>
+        <div style={{ fontSize: '10px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px' }}>
+          Station A / Station B
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
+          {[
+            { label: 'Temperature', valA: `${fmt1(a.temperature)}°C`, valB: `${fmt1(b.temperature)}°C` },
+            { label: 'Wind', valA: `${fmt1(a.wind_speed)} km/h`, valB: `${fmt1(b.wind_speed)} km/h` },
+            { label: 'Rain', valA: getRainLabel(a.rain), valB: getRainLabel(b.rain) },
+            { label: 'Humidity', valA: `${Math.round(a.humidity)}%`, valB: `${Math.round(b.humidity)}%` },
+            { label: 'Pressure', valA: `${Math.round(a.pressure)} hPa`, valB: `${Math.round(b.pressure)} hPa` },
+          ].map(({ label, valA, valB }) => (
+            <div key={label} style={styles.kpi}>
+              <div style={styles.kpiLabel}>{label}</div>
+              <div style={{ ...styles.mono, fontSize: '12px', color: '#e2e8f0' }}>{valA}</div>
+              <div style={{ ...styles.mono, fontSize: '11px', color: '#475569' }}>{valB}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Optional user location ── */}
       {u && (
-        <div className="mt-4 pt-3 border-t border-border-light dark:border-border-dark">
-          <div className="text-xs font-semibold mb-2 text-text-light-secondary dark:text-text-dark-secondary">
+        <div style={{ marginTop: '12px', borderTop: '1px solid #1e2a4a', paddingTop: '10px' }}>
+          <div style={{ fontSize: '10px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px' }}>
             Your Location
           </div>
-          <div className="grid grid-cols-2 gap-1 text-xs">
-            <span className="text-text-light-secondary dark:text-text-dark-secondary">Temp</span>
-            <span className="font-semibold text-right">{fmt1(u.temperature)}°C</span>
-            <span className="text-text-light-secondary dark:text-text-dark-secondary">Wind</span>
-            <span className="font-semibold text-right">{fmt1(u.wind_speed)} km/h</span>
-            <span className="text-text-light-secondary dark:text-text-dark-secondary">Rain</span>
-            <span className="font-semibold text-right">{fmt1(u.rain)} mm/h</span>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
+            {[
+              { label: 'Temp', val: `${fmt1(u.temperature)}°C` },
+              { label: 'Wind', val: `${fmt1(u.wind_speed)} km/h` },
+              { label: 'Rain', val: getRainLabel(u.rain) },
+            ].map(({ label, val }) => (
+              <div key={label} style={styles.kpi}>
+                <div style={styles.kpiLabel}>{label}</div>
+                <div style={{ ...styles.mono, fontSize: '14px', color: '#e2e8f0' }}>{val}</div>
+              </div>
+            ))}
           </div>
         </div>
       )}
-    </Card>
+    </div>
   );
 };
 

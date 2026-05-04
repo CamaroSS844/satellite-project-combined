@@ -89,13 +89,14 @@ class ConnectionState(BaseModel):
 
 class StationState(BaseModel):
     station_id:     str
-    mode:           Mode           = Mode.AUTO
+    mode:           Mode            = Mode.AUTO
     connection:     ConnectionState = ConnectionState()
     current_angles: Angles          = Angles(azimuth=0.0, elevation=0.0)
     target_angles:  Optional[Angles] = None
     command:        CommandState    = CommandState()
     error:          ErrorState      = ErrorState()
-    signal_dbm:     float           = -65.0   # simulated signal strength
+    # ── signal_dbm is now live: updated every heartbeat from the ESP32 ──
+    signal_dbm:     float           = -99.0   # -99 = no reading yet
 
 
 class WeatherData(BaseModel):
@@ -220,7 +221,6 @@ async def fetch_weather(lat: float, lon: float) -> WeatherData:
             )
     except Exception as e:
         print(f"[WEATHER] Failed to fetch ({lat},{lon}): {e}")
-        # Fallback values so dashboard never breaks
         return WeatherData(
             temperature=25.0, wind_speed=12.0, rain=0.0,
             humidity=65.0, pressure=1012.0,
@@ -243,8 +243,8 @@ app.add_middleware(
 
 # In-memory stores
 stations: Dict[str, StationState] = {}
-weather_cache: Dict[str, WeatherData] = {}   # keyed by "lat,lon"
-realignment_counts: Dict[str, int] = {}      # per-station command counts
+weather_cache: Dict[str, WeatherData] = {}
+realignment_counts: Dict[str, int] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,7 +268,9 @@ def _cache_key(lat: float, lon: float) -> str:
 
 class HeartbeatIn(BaseModel):
     station_id: str
-    mode: Mode
+    mode:       Mode
+    # ── NEW: ESP32 now reports measured RSSI toward its peer station ──
+    signal_dbm: Optional[float] = None   # None = old firmware, ignore gracefully
 
 
 @app.post("/esp32/heartbeat")
@@ -277,8 +279,14 @@ def heartbeat(data: HeartbeatIn):
     station = get_station(data.station_id)
     station.connection.last_heartbeat = datetime.now(timezone.utc)
     station.connection.online = True
+
+    # Update live signal strength when the ESP32 provides it
+    if data.signal_dbm is not None:
+        station.signal_dbm = data.signal_dbm
+
     if station.mode != data.mode:
         log_state(f"Mode mismatch ESP32={data.mode} Backend={station.mode}", station)
+
     return {"status": "ok", "authoritative_mode": station.mode}
 
 
@@ -334,6 +342,7 @@ def report_error(data: ErrorIn):
 
 @app.get("/dashboard/stations")
 def get_all_stations():
+    # signal_dbm is part of StationState so it is already included here
     return stations
 
 
@@ -430,6 +439,7 @@ def system_status():
             "station_id":    sid,
             "label":         STATION_COORDS.get(sid, {}).get("label", sid),
             "status":        "ONLINE" if st.connection.online else "OFFLINE",
+            # signal_dbm is now the live value pushed by the ESP32 heartbeat
             "signal_dbm":    st.signal_dbm,
             "azimuth":       st.current_angles.azimuth,
             "elevation":     st.current_angles.elevation,
@@ -533,13 +543,14 @@ def _build_pdf() -> bytes:
     rows = [["Station", "Status", "Mode", "Azimuth (°)", "Elevation (°)", "Signal (dBm)"]]
     for sid, st in stations.items():
         label = STATION_COORDS.get(sid, {}).get("label", sid)
+        sig   = f"{st.signal_dbm:.1f}" if st.signal_dbm > -99 else "N/A"
         rows.append([
             label,
             "ONLINE" if st.connection.online else "OFFLINE",
             st.mode,
             f"{st.current_angles.azimuth:.1f}",
             f"{st.current_angles.elevation:.1f}",
-            f"{st.signal_dbm:.1f}",
+            sig,
         ])
     if len(rows) == 1:
         rows.append(["No stations registered yet", "-", "-", "-", "-", "-"])
@@ -703,18 +714,17 @@ async def heartbeat_monitor():
 
 async def auto_weather_refresh():
     """Refresh weather every 5 minutes and persist."""
-    await asyncio.sleep(5)   # initial delay
+    await asyncio.sleep(5)
     while True:
         for sid, coords in STATION_COORDS.items():
             w = await fetch_weather(coords["lat"], coords["lon"])
             persist_env(sid, w)
-        await asyncio.sleep(300)   # 5 min
+        await asyncio.sleep(300)
 
 
 @app.on_event("startup")
 async def startup():
     init_db()
-    # Seed demo stations so the dashboard has data immediately
     for sid in STATION_COORDS:
         get_station(sid)
     asyncio.create_task(heartbeat_monitor())
