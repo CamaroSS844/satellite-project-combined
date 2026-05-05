@@ -11,6 +11,8 @@ import KpiPanel from './components/KpiPanel';
 import { useTheme } from './hooks/useTheme';
 import BeamAlignmentPanel from './components/Beamalignmentpanel';
 import PolarRadiationPanel from './components/Polarradiationpanel';
+import GPRPanel from './components/GPRPanel';
+import { OperationalMode } from './types';
 
 const App: React.FC = () => {
   const [theme, toggleTheme] = useTheme();
@@ -48,7 +50,15 @@ const App: React.FC = () => {
               sendManualCommand={sendManualCommand}
               resetError={resetError}
             />
+            <GPRPanel
+            stationId="station_1"
+            currentAz={stations[s].current_angles.azimuth}
+            currentEl={stations[s].current_angles.elevation}
+            onApply={(id, az, el) => sendManualCommand(id, az, el)}
+            autoMode={stations[s].mode === OperationalMode.AUTO}
+          />
           </div>
+          
         ))}
 
         <div className="col-span-12 lg:col-span-12 space-y-4">
