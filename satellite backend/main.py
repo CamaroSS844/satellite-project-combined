@@ -18,6 +18,9 @@ import json
 import sqlite3
 import httpx
 import io
+# ADD after "import httpx"
+import numpy as np
+from scipy.optimize import minimize
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -34,6 +37,19 @@ from reportlab.platypus import (
 HEARTBEAT_TIMEOUT   = timedelta(seconds=10)
 ANGLE_TOLERANCE     = 0.5      # servo command tolerance (degrees)
 IMU_VERIFY_TOLERANCE = 3.0     # IMU must move at least this many degrees to call it a success
+
+# ── SWEEP & OPTIMIZER CONSTANTS ───────────────────────────────────────────
+SWEEP_AZ_START   = 10.0
+SWEEP_AZ_END     = 150.0
+SWEEP_EL_START   = 10.0
+SWEEP_EL_END     = 150.0
+SWEEP_AZ_STEP    = 70.0   # coarse grid spacing in degrees
+SWEEP_EL_STEP    = 70.0
+REDISCOVER_DROP_DBM   = 5.0    # dB drop triggers re-sweep
+RECAL_VARIANCE_THRESH = 3.0    # dBm² sustained variance triggers re-sweep
+RECAL_WINDOW          = 15     # how many recent samples to watch for instability
+# ─────────────────────────────────────────────────────────────────────────
+
 LOG_LEVEL           = "STATE"  # OFF | ACCESS | STATE
 
 STATION_COORDS = {
@@ -105,6 +121,39 @@ class MovementVerification(BaseModel):
     target_az:        float           = 0.0
     target_el:        float           = 0.0
     verified_at:      Optional[datetime] = None
+
+# ── ADD THIS ENTIRE BLOCK ─────────────────────────────────────────────────────
+class OptimPhase(str, Enum):
+    COARSE = "COARSE"
+    REFINE = "REFINE"
+    LOCK   = "LOCK"
+
+
+class OptimSample(BaseModel):
+    azimuth:    float
+    elevation:  float
+    signal_dbm: float
+
+
+class OptimSession(BaseModel):
+    active:          bool             = False
+    phase:           OptimPhase       = OptimPhase.COARSE
+    samples:         List[OptimSample]= []
+    best_signal:     float            = -999.0
+    best_az:         float            = 0.0
+    best_el:         float            = 0.0
+    iteration:       int              = 0
+    last_commanded:  Optional[Angles] = None
+    converged:       bool             = False
+     # ── sweep fields ──────────────────────────────────────────────────────
+    sweep_queue:     List[List[float]] = []   # list of [az, el] waypoints
+    sweeping:        bool              = False
+    sweep_reason:    str               = ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
 
 
 class StationState(BaseModel):
@@ -260,6 +309,98 @@ def persist_verification(station_id: str, success: bool, imu_az_delta: float,
         (ts, station_id, int(success), imu_az_delta, imu_el_delta, target_az, target_el)
     )
 
+# ── ADD THIS ENTIRE FUNCTION ──────────────────────────────────────────────────
+def fit_quadratic_peak(samples: List[OptimSample]):
+    """
+    Fit S = a·x² + b·y² + c·xy + d·x + e·y + f  via least squares.
+    Returns (best_az, best_el) predicted peak, or None if underdetermined.
+    Operates only on LOCAL samples — no global smoothness assumption.
+    """
+    if len(samples) < 6:
+        return None   # need at least 6 points for 6 coefficients
+
+    xs = np.array([s.azimuth    for s in samples])
+    ys = np.array([s.elevation  for s in samples])
+    zs = np.array([s.signal_dbm for s in samples])
+
+    # Normalise to improve numerical conditioning
+    x0, y0 = xs.mean(), ys.mean()
+    xn, yn = xs - x0, ys - y0
+
+    # Design matrix: [x² y² xy x y 1]
+    A = np.column_stack([xn**2, yn**2, xn*yn, xn, yn, np.ones_like(xn)])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, zs, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    a, b, c, d, e, _ = coeffs
+
+    # Peak: solve ∂S/∂x = 2ax + cy + d = 0
+    #              ∂S/∂y = 2by + cx + e = 0
+    M = np.array([[2*a, c], [c, 2*b]])
+    rhs = np.array([-d, -e])
+    try:
+        peak_norm = np.linalg.solve(M, rhs)
+    except np.linalg.LinAlgError:
+        return None
+
+    # Check the Hessian is negative definite (actual maximum, not minimum)
+    if a >= 0 or (4*a*b - c**2) <= 0:
+        return None   # surface opens upward — no maximum here
+
+    peak_az = float(peak_norm[0]) + x0
+    peak_el = float(peak_norm[1]) + y0
+    return peak_az, peak_el
+
+def build_sweep_grid(
+    az_start: float = SWEEP_AZ_START, az_end: float = SWEEP_AZ_END,
+    el_start: float = SWEEP_EL_START, el_end: float = SWEEP_EL_END,
+    az_step:  float = SWEEP_AZ_STEP,  el_step: float = SWEEP_EL_STEP,
+) -> List[List[float]]:
+    """
+    Build a boustrophedon (snake) grid of (az, el) waypoints.
+    Alternates direction each elevation row to minimise servo travel.
+    """
+    grid = []
+    el = el_start
+    row = 0
+    while el <= el_end + 0.01:
+        az_range = list(np.arange(az_start, az_end + 0.01, az_step))
+        if row % 2 == 1:
+            az_range = az_range[::-1]   # reverse alternate rows
+        for az in az_range:
+            grid.append([round(az, 1), round(el, 1)])
+        el += el_step
+        row += 1
+    return grid
+
+
+def build_local_sweep(center_az: float, center_el: float,
+                      radius: float = 20.0, step: float = 5.0) -> List[List[float]]:
+    """
+    Small spiral grid around a known-good position.
+    Used for recalibration after a disturbance — much faster than full sweep.
+    """
+    grid = []
+    az_start = max(SWEEP_AZ_START, center_az - radius)
+    az_end   = min(SWEEP_AZ_END,   center_az + radius)
+    el_start = max(SWEEP_EL_START, center_el - radius)
+    el_end   = min(SWEEP_EL_END,   center_el + radius)
+    el = el_start
+    row = 0
+    while el <= el_end + 0.01:
+        az_range = list(np.arange(az_start, az_end + 0.01, step))
+        if row % 2 == 1:
+            az_range = az_range[::-1]
+        for az in az_range:
+            grid.append([round(az, 1), round(el, 1)])
+        el += step
+        row += 1
+    return grid
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WEATHER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,6 +451,8 @@ stations: Dict[str, StationState] = {}
 weather_cache: Dict[str, WeatherData] = {}
 realignment_counts: Dict[str, int] = {}
 
+optim_sessions: Dict[str, OptimSession] = {}   # ADD THIS LINE
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,14 +497,68 @@ def heartbeat(data: HeartbeatIn):
                 data.elevation,
                 station.signal_dbm,   # use the stored value — already updated above
             )
+    # ── OPTIMIZER HOOK ────────────────────────────────────────────────────────
+    # ── OPTIMIZER HOOK ────────────────────────────────────────────────────────
+    sess = optim_sessions.get(data.station_id)
+
+    # Create session on first heartbeat from this station (not at server startup)
+    if sess is None and station.mode == Mode.AUTO:
+        grid = build_sweep_grid()
+        sess = OptimSession(
+            active       = True,
+            phase        = OptimPhase.COARSE,
+            samples      = [],
+            best_signal  = data.signal_dbm if data.signal_dbm is not None else -999.0,
+            best_az      = data.azimuth if data.azimuth is not None else station.current_angles.azimuth,
+            best_el      = data.elevation if data.elevation is not None else station.current_angles.elevation,
+            iteration    = 0,
+            converged    = False,
+            sweep_queue  = grid,
+            sweeping     = True,
+            sweep_reason = "boot sweep",
+        )
+        optim_sessions[data.station_id] = sess
+        log_to_db(data.station_id,
+                  f"ESP32 connected — boot sweep started ({len(grid)} waypoints)", "INFO")
+
+    # Collect sample into active session
+    if sess and sess.active and not sess.converged:
+        if data.signal_dbm is not None and data.azimuth is not None and data.elevation is not None:
+            sess.samples.append(OptimSample(
+                azimuth    = data.azimuth,
+                elevation  = data.elevation,
+                signal_dbm = data.signal_dbm,
+            ))
+            if data.signal_dbm > sess.best_signal:
+                sess.best_signal = data.signal_dbm
+                sess.best_az     = data.azimuth
+                sess.best_el     = data.elevation
+
+    # While LOCKED: keep a rolling window of recent samples for disturbance detection
+    # and track the current running signal so drop detection uses a live reference
+    if sess and sess.converged:
+        if data.signal_dbm is not None and data.azimuth is not None and data.elevation is not None:
+            sess.samples.append(OptimSample(
+                azimuth    = data.azimuth,
+                elevation  = data.elevation,
+                signal_dbm = data.signal_dbm,
+            ))
+            # Cap to avoid unbounded growth — keep last 60 samples
+            if len(sess.samples) > 60:
+                sess.samples = sess.samples[-60:]
+    # ── END OPTIMIZER HOOK ───────────────────────────────────────────────────
 
     if station.mode != data.mode:
         log_state(f"Mode mismatch ESP32={data.mode} Backend={station.mode}", station)
 
+    sess_now = optim_sessions.get(data.station_id)
     return {
         "status":              "ok",
         "authoritative_mode":  station.mode,
         "calibrate":           station.calibration_pending,
+        "optim_phase":         sess_now.phase if sess_now else None,
+        "optim_sweeping":      sess_now.sweeping if sess_now else False,
+        "optim_converged":     sess_now.converged if sess_now else False,
     }
 
 @app.get("/esp32/state/{station_id}")
@@ -621,6 +818,161 @@ def get_position_signal_log(station_id: str, limit: int = 200):
         (station_id, limit)
     )
     return {"station_id": station_id, "records": rows}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIMIZER ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/optimizer/start/{station_id}")
+def optimizer_start(station_id: str):
+    """Initialise a new optimisation session for a station."""
+    station = get_station(station_id)
+
+    optim_sessions[station_id] = OptimSession(
+        active      = True,
+        phase       = OptimPhase.COARSE,
+        samples     = [],
+        best_signal = station.signal_dbm if station.signal_dbm > -99 else -999.0,
+        best_az     = station.current_angles.azimuth,
+        best_el     = station.current_angles.elevation,
+        iteration   = 0,
+        converged   = False,
+    )
+    # Ensure station is in AUTO so existing command plumbing works
+    station.mode = Mode.AUTO
+    log_to_db(station_id, "Optimizer started — COARSE phase", "INFO")
+    return {"status": "optimizer_started", "station_id": station_id}
+
+
+@app.post("/optimizer/step/{station_id}")
+def optimizer_step(station_id: str):
+    """
+    Run one optimisation step:
+      1. Fit quadratic surface to LOCAL samples near current best
+      2. Predict peak angles
+      3. Issue movement command via existing command system
+    """
+    sess = optim_sessions.get(station_id)
+    if not sess or not sess.active:
+        raise HTTPException(400, "No active optimizer session for this station")
+    if sess.converged:
+        return {"status": "already_converged", "best_az": sess.best_az, "best_el": sess.best_el}
+
+    station = get_station(station_id)
+
+    # ── Select LOCAL samples: within ±15° of current best ──────────────────
+    LOCAL_WINDOW = 15.0
+    local_samples = [
+        s for s in sess.samples
+        if abs(s.azimuth   - sess.best_az) <= LOCAL_WINDOW
+        and abs(s.elevation - sess.best_el) <= LOCAL_WINDOW
+    ]
+
+    peak = fit_quadratic_peak(local_samples) if len(local_samples) >= 6 else None
+
+    if peak is None:
+        # Not enough data yet — nudge toward best known position with small offsets
+        # to collect more samples around the neighbourhood
+        NUDGE = 3.0
+        sess.iteration += 1
+        nudge_az = sess.best_az + (NUDGE if sess.iteration % 2 == 0 else -NUDGE)
+        nudge_el = sess.best_el + (NUDGE if (sess.iteration // 2) % 2 == 0 else -NUDGE)
+        target_az = float(np.clip(nudge_az, MIN_AZ, MAX_AZ))
+        target_el = float(np.clip(nudge_el, MIN_EL, MAX_EL))
+        reason = "nudge — collecting samples"
+    else:
+        # Clamp predicted peak to servo limits
+        MIN_AZ, MAX_AZ = 10.0, 150.0
+        MIN_EL, MAX_EL = 10.0, 150.0
+        target_az = float(np.clip(peak[0], MIN_AZ, MAX_AZ))
+        target_el = float(np.clip(peak[1], MIN_EL, MAX_EL))
+        sess.phase = OptimPhase.REFINE
+        sess.iteration += 1
+        reason = "quadratic peak prediction"
+
+    # ── Issue command via existing command system ────────────────────────────
+    station.target_angles = Angles(azimuth=target_az, elevation=target_el)
+    station.command = CommandState(
+        pending=True,
+        issued_at=datetime.now(timezone.utc),
+        acknowledged=False,
+    )
+    sess.last_commanded = Angles(azimuth=target_az, elevation=target_el)
+
+    log_to_db(station_id,
+              f"Optimizer step {sess.iteration}: move to AZ={target_az:.1f} EL={target_el:.1f} [{reason}]")
+
+    return {
+        "status":      "command_issued",
+        "iteration":   sess.iteration,
+        "phase":       sess.phase,
+        "target_az":   target_az,
+        "target_el":   target_el,
+        "reason":      reason,
+        "sample_count": len(sess.samples),
+        "local_count":  len(local_samples),
+        "best_signal": sess.best_signal,
+    }
+
+
+@app.post("/optimizer/check/{station_id}")
+def optimizer_check(station_id: str):
+    """
+    Check convergence:
+      - Look at the last N samples near the best position
+      - If RSSI variance is low → LOCK and stop
+    """
+    RECENT_N       = 10
+    VAR_THRESHOLD  = 1.5    # dBm² — tune to your environment
+    MIN_SAMPLES    = 10     # don't converge too early
+
+    sess = optim_sessions.get(station_id)
+    if not sess or not sess.active:
+        raise HTTPException(400, "No active optimizer session for this station")
+
+    if len(sess.samples) < MIN_SAMPLES:
+        return {"status": "collecting", "sample_count": len(sess.samples)}
+
+    # Take the most recent RECENT_N samples
+    recent = sess.samples[-RECENT_N:]
+    signals = [s.signal_dbm for s in recent]
+    variance = float(np.var(signals))
+
+    if variance <= VAR_THRESHOLD:
+        sess.active    = False
+        sess.converged = True
+        sess.phase     = OptimPhase.LOCK
+        log_to_db(station_id,
+                  f"Optimizer LOCKED — best AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
+                  f"signal={sess.best_signal:.1f} dBm (variance={variance:.2f})", "INFO")
+        return {
+            "status":       "converged",
+            "best_az":      sess.best_az,
+            "best_el":      sess.best_el,
+            "best_signal":  sess.best_signal,
+            "variance":     variance,
+            "iterations":   sess.iteration,
+        }
+
+    return {
+        "status":       "optimizing",
+        "variance":     variance,
+        "sample_count": len(sess.samples),
+        "best_signal":  sess.best_signal,
+        "phase":        sess.phase,
+    }
+
+
+@app.get("/optimizer/status/{station_id}")
+def optimizer_status(station_id: str):
+    """Read-only view of the current optimiser session."""
+    sess = optim_sessions.get(station_id)
+    if not sess:
+        return {"active": False, "station_id": station_id}
+    return sess
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENVIRONMENTAL DATA
 # ─────────────────────────────────────────────────────────────────────────────
@@ -675,6 +1027,11 @@ def system_status():
             "imu_calibrated":      st.imu.calibrated,
             "calibration_pending": st.calibration_pending,
             "last_verify_ok":      st.last_verification.success,
+            # optimizer state
+            "optim_phase":         optim_sessions[sid].phase if sid in optim_sessions else None,
+            "optim_converged":     optim_sessions[sid].converged if sid in optim_sessions else None,
+            "optim_best_signal":   optim_sessions[sid].best_signal if sid in optim_sessions else None,
+            "optim_sweep_remaining": len(optim_sessions[sid].sweep_queue) if sid in optim_sessions else 0,
         }
 
     if stations:
@@ -921,6 +1278,171 @@ def download_pdf():
 # BACKGROUND TASKS
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def optimizer_loop():
+    """
+    Autonomous alignment loop. States:
+      COARSE  → executing sweep_queue waypoints (boot sweep or recal sweep)
+      REFINE  → quadratic regression homing
+      LOCK    → holding; watching for disturbances
+    """
+    STEP_INTERVAL           = 4      # seconds between commands while refining
+    CHECK_INTERVAL          = 3      # seconds between convergence checks
+    LOCK_WATCH_INTERVAL     = 2      # seconds between disturbance checks while locked
+    MIN_SAMPLES_FOR_REFINE  = 6      # minimum samples before attempting regression
+
+    step_timers:  Dict[str, float] = {}
+    check_timers: Dict[str, float] = {}
+    watch_timers: Dict[str, float] = {}
+
+    await asyncio.sleep(8)   # let stations connect and send first heartbeats
+
+    while True:
+        now = asyncio.get_event_loop().time()
+
+        for station_id, sess in list(optim_sessions.items()):
+            station = stations.get(station_id)
+            if not station or station.mode != Mode.AUTO:
+                continue
+
+            # ── LOCKED: watch for disturbances ───────────────────────────
+            if sess.converged:
+                last_watch = watch_timers.get(station_id, 0)
+                if now - last_watch < LOCK_WATCH_INTERVAL:
+                    continue
+                watch_timers[station_id] = now
+
+                if len(sess.samples) < RECAL_WINDOW:
+                    continue
+
+                recent  = sess.samples[-RECAL_WINDOW:]
+                signals = [s.signal_dbm for s in recent]
+                current_signal = signals[-1]
+                variance = float(np.var(signals))
+
+                # Use rolling average of recent stable window as reference,
+                # NOT the frozen best_signal from the sweep — that prevents
+                # false triggers after signal naturally settles lower over time
+                rolling_avg = sum(signals) / len(signals)
+                drop_triggered     = current_signal < (rolling_avg - REDISCOVER_DROP_DBM)
+                variance_triggered = variance > RECAL_VARIANCE_THRESH
+
+                if drop_triggered or variance_triggered:
+                    reason = (
+                        f"signal drop {current_signal:.1f} vs best {sess.best_signal:.1f} dBm"
+                        if drop_triggered
+                        else f"variance {variance:.2f} dBm² exceeds threshold"
+                    )
+                    log_to_db(station_id, f"Disturbance detected ({reason}) — starting local recal sweep", "WARN")
+
+                    # Local sweep around last known best — faster than full sweep
+                    sess.sweep_queue  = build_local_sweep(sess.best_az, sess.best_el,
+                                                          radius=25.0, step=12.5)
+                    sess.sweeping     = True
+                    sess.converged    = False
+                    sess.active       = True
+                    sess.phase        = OptimPhase.COARSE
+                    sess.samples      = []
+                    sess.iteration    = 0
+                    sess.sweep_reason = reason
+                continue   # handled above; skip refine logic
+
+            if not sess.active:
+                continue
+
+            # ── COARSE: drain the sweep queue ────────────────────────────
+            if sess.sweeping and sess.sweep_queue:
+                if station.command.pending:
+                    continue   # wait for ESP32 to finish current move
+
+                waypoint = sess.sweep_queue.pop(0)
+                target_az, target_el = waypoint[0], waypoint[1]
+
+                station.target_angles = Angles(azimuth=target_az, elevation=target_el)
+                station.command = CommandState(
+                    pending=True,
+                    issued_at=datetime.now(timezone.utc),
+                    acknowledged=False,
+                )
+                sess.last_commanded = Angles(azimuth=target_az, elevation=target_el)
+                sess.iteration += 1
+
+                remaining = len(sess.sweep_queue)
+                log_to_db(station_id,
+                          f"[SWEEP] step={sess.iteration} → AZ={target_az} EL={target_el} "
+                          f"remaining={remaining} reason='{sess.sweep_reason}'")
+
+                # Sweep finished — transition to REFINE
+                if not sess.sweep_queue:
+                    sess.sweeping = False
+                    sess.phase    = OptimPhase.REFINE
+                    log_to_db(station_id,
+                              f"Sweep complete — {len(sess.samples)} samples collected, entering REFINE")
+                continue
+
+            # ── REFINE: quadratic regression toward peak ──────────────────
+            last_step = step_timers.get(station_id, 0)
+            if now - last_step < STEP_INTERVAL:
+                pass   # fall through to convergence check
+            elif not station.command.pending and len(sess.samples) >= MIN_SAMPLES_FOR_REFINE:
+                step_timers[station_id] = now
+
+                MIN_AZ, MAX_AZ = SWEEP_AZ_START, SWEEP_AZ_END
+                MIN_EL, MAX_EL = SWEEP_EL_START, SWEEP_EL_END
+                LOCAL_WINDOW   = 20.0
+                NUDGE          = 4.0
+
+                local_samples = [
+                    s for s in sess.samples
+                    if abs(s.azimuth   - sess.best_az) <= LOCAL_WINDOW
+                    and abs(s.elevation - sess.best_el) <= LOCAL_WINDOW
+                ]
+
+                peak = fit_quadratic_peak(local_samples) if len(local_samples) >= 6 else None
+
+                if peak is None:
+                    sess.iteration += 1
+                    angle    = sess.iteration * 1.2
+                    nudge_az = sess.best_az + NUDGE * np.cos(angle)
+                    nudge_el = sess.best_el + NUDGE * np.sin(angle)
+                    target_az = float(np.clip(nudge_az, MIN_AZ, MAX_AZ))
+                    target_el = float(np.clip(nudge_el, MIN_EL, MAX_EL))
+                    reason = "spiral nudge"
+                else:
+                    target_az = float(np.clip(peak[0], MIN_AZ, MAX_AZ))
+                    target_el = float(np.clip(peak[1], MIN_EL, MAX_EL))
+                    sess.phase = OptimPhase.REFINE
+                    sess.iteration += 1
+                    reason = "quadratic peak"
+
+                station.target_angles = Angles(azimuth=target_az, elevation=target_el)
+                station.command = CommandState(
+                    pending=True,
+                    issued_at=datetime.now(timezone.utc),
+                    acknowledged=False,
+                )
+                sess.last_commanded = Angles(azimuth=target_az, elevation=target_el)
+                log_to_db(station_id,
+                          f"[REFINE] step={sess.iteration} → AZ={target_az:.1f} EL={target_el:.1f} "
+                          f"[{reason}] samples={len(sess.samples)}")
+
+            # ── CONVERGENCE CHECK ─────────────────────────────────────────
+            last_check = check_timers.get(station_id, 0)
+            if now - last_check >= CHECK_INTERVAL and len(sess.samples) >= 10:
+                check_timers[station_id] = now
+                recent   = sess.samples[-10:]
+                signals  = [s.signal_dbm for s in recent]
+                variance = float(np.var(signals))
+
+                if variance <= 1.5:
+                    sess.active    = False
+                    sess.converged = True
+                    sess.phase     = OptimPhase.LOCK
+                    log_to_db(station_id,
+                              f"LOCKED — AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
+                              f"signal={sess.best_signal:.1f} dBm var={variance:.2f}", "INFO")
+
+        await asyncio.sleep(0.5)
+
 async def heartbeat_monitor():
     while True:
         now = datetime.now(timezone.utc)
@@ -947,6 +1469,10 @@ async def startup():
     init_db()
     for sid in STATION_COORDS:
         get_station(sid)
+        # DO NOT pre-create optim_sessions here.
+        # Sessions are created on first ESP32 heartbeat so the
+        # sweep starts from the actual boot position, not server start.
     asyncio.create_task(heartbeat_monitor())
     asyncio.create_task(auto_weather_refresh())
     log_to_db("system", "Backend v3 started — IMU feedback active")
+    asyncio.create_task(optimizer_loop())
