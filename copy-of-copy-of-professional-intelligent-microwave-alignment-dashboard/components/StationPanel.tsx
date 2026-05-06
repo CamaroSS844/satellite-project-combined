@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StationData, OperationalMode } from '../types';
+
 
 /* ─────────────────────────────────────────────────────────────────────────────
    Style injection — mirrors the HTML dashboard's CSS exactly
@@ -181,7 +182,45 @@ const STYLES = `
     font-family: 'IBM Plex Mono', monospace;
     font-size: 13px; color: #94a3b8;
   }
-`;
+
+  /* ── signal history graph ── */
+  .ma-hist-wrap {
+    margin-bottom: 14px;
+  }
+  .ma-hist-label {
+    font-size: 10px;
+    color: #475569;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .ma-hist-live {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: #334155;
+  }
+  .ma-hist-canvas {
+    display: block;
+    width: 100%;
+    height: 56px;
+    border-radius: 3px;
+    background: #060b18;
+  }
+  .ma-hist-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 3px;
+  }
+  .ma-hist-axis-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    color: #1e2a4a;
+  }
+
+  `;
 
 function injectStyles() {
   if (typeof document !== 'undefined' && !document.getElementById('ma-station-styles')) {
@@ -192,6 +231,105 @@ function injectStyles() {
   }
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   Signal history fetch hook
+   Pulls from GET /dashboard/position_signal_log/{station_id}?limit=40
+   Falls back to empty array on error — never blocks render.
+───────────────────────────────────────────────────────────────────────────── */
+const BASE_URL = 'http://192.168.100.14:8000';
+
+function useSignalHistory(stationId: string, online: boolean, liveRssi: number) {
+  const [history, setHistory] = useState<number[]>([]);
+
+  // Seed from position_signal_log on mount and every 5 s
+  useEffect(() => {
+    if (!online) return;
+
+    async function fetchHistory() {
+      try {
+        const res = await fetch(
+          `${BASE_URL}/dashboard/position_signal_log/${stationId}?limit=40`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        const signals: number[] = (data.records ?? [])
+          .slice()
+          .reverse()
+          .map((r: any) => r.signal_dbm as number)
+          .filter((v: number) => v > -99);
+        setHistory(signals);
+      } catch {
+        // ignore
+      }
+    }
+
+    fetchHistory();
+    const id = setInterval(fetchHistory, 5000);
+    return () => clearInterval(id);
+  }, [stationId, online]);
+
+  // Append live RSSI from heartbeat every second so graph moves even when locked
+  useEffect(() => {
+    if (!online || !hasSignal(liveRssi)) return;
+
+    const id = setInterval(() => {
+      setHistory(prev => {
+        const next = [...prev, liveRssi];
+        return next.length > 60 ? next.slice(-60) : next;
+      });
+    }, 1500);
+
+    return () => clearInterval(id);
+  }, [online, liveRssi]);
+
+  return history;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Signal history canvas — mirrors the HTML dashboard drawHist() exactly
+───────────────────────────────────────────────────────────────────────────── */
+function drawSignalHistory(
+  canvas: HTMLCanvasElement,
+  data: number[],
+  color: string
+) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Match HTML exactly: min=-75, max=-35
+  const min = -75;
+  const max = -35;
+  const range = max - min;
+
+  // 4 grid lines at -70, -60, -50, -40 (same as HTML)
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  [-70, -60, -50, -40].forEach(v => {
+    const y = h - ((v - min) / range) * h;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  });
+
+  if (data.length < 2) return;
+
+  // Signal line only — no fill, matching HTML drawHist exactly
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = (i / (data.length - 1)) * w;
+    const y = h - ((v - min) / range) * h;
+    if (i === 0) ctx.moveTo(x, y);
+    else         ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
 /* ─────────────────────────────────────────────────────────────────────────────
    Helpers
 ───────────────────────────────────────────────────────────────────────────── */
@@ -263,9 +401,46 @@ const StationPanel: React.FC<StationPanelProps> = ({
 
   const s: StationData = station ?? DEFAULT_STATION;
 
+  const online   = s.connection.online;
+  const rssi     = (s as any).signal_dbm ?? -99 as number;
+
   const [localAz, setLocalAz] = useState(s.current_angles.azimuth);
   const [localEl, setLocalEl] = useState(s.current_angles.elevation);
   const [isDragging, setIsDragging] = useState(false);
+
+  // ── Signal history ──────────────────────────────────────────────────────
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const history   = useSignalHistory(s.station_id, online, rssi);
+
+  // Colour matches HTML dashboard: station_1 → blue, others → green
+  const histColor = s.station_id === 'station_1' ? '#2563eb' : '#16a34a';
+
+ // Set canvas pixel dimensions once after mount
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const setSize = () => {
+      const w = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 300;
+      if (canvas.width !== w) canvas.width = w;
+      canvas.height = 56;
+    };
+    setSize();
+    const ro = new ResizeObserver(setSize);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, []); // runs once only
+
+  // Redraw whenever history or color changes
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    if (canvas.width === 0) {
+      canvas.width = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 300;
+      canvas.height = 56;
+    }
+    drawSignalHistory(canvas, history, histColor);
+  }, [history, histColor]);
+
 
   /* Sync angles from backend when user isn't dragging */
   useEffect(() => {
@@ -288,9 +463,8 @@ const StationPanel: React.FC<StationPanelProps> = ({
    * The old fallback `(s as any).telemetry?.rssi ?? -48` is removed because
    * it silently masked missing data with a plausible-looking fake value.
    */
-  const rssi: number = (s as any).signal_dbm ?? -99;
+  
 
-  const online   = s.connection.online;
   const hasError = s.error.has_error;
   const pending  = s.command.pending;
   const isManual = s.mode === OperationalMode.MANUAL;
@@ -333,6 +507,8 @@ const StationPanel: React.FC<StationPanelProps> = ({
           </div>
         </div>
       </div>
+
+      
 
       {/* ── Error banner ─────────────────────────────────────────────────── */}
       {hasError && (
@@ -437,7 +613,28 @@ const StationPanel: React.FC<StationPanelProps> = ({
             )}
           </div>
         </div>
-
+            
+      </div>
+      {/* ── Signal history graph ─────────────────────────────────────────── */}
+      <div className="ma-hist-wrap" style={{ marginTop: '14px' }}>
+        <div className="ma-hist-label">
+          <span>Signal history</span>
+          <span className="ma-hist-live">
+            {history.length > 0
+              ? `${history[history.length - 1].toFixed(1)} dBm · ${history.length} pts`
+              : online ? 'waiting for data…' : 'offline'}
+          </span>
+        </div>
+        <canvas
+          ref={canvasRef}
+          className="ma-hist-canvas"
+        />
+        <div className="ma-hist-axis">
+          <span className="ma-hist-axis-val">-75</span>
+          <span className="ma-hist-axis-val">-60</span>
+          <span className="ma-hist-axis-val">-45</span>
+          <span className="ma-hist-axis-val">-35 dBm</span>
+        </div>
       </div>
     </div>
   );
