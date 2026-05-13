@@ -12,6 +12,7 @@ import { useTheme } from './hooks/useTheme';
 import BeamAlignmentPanel from './components/Beamalignmentpanel';
 import PolarRadiationPanel from './components/Polarradiationpanel';
 import { OperationalMode } from './types';
+import SignalHistoryChart from './components/SignalHistoryChart';
 
 const App: React.FC = () => {
   const [theme, toggleTheme] = useTheme();
@@ -52,6 +53,7 @@ const App: React.FC = () => {
           </div>
           
         ))}
+        
 
         <div className="col-span-12 lg:col-span-12 space-y-4">
           {/* Environmental panel mapping updated to support multiple stations if available */}

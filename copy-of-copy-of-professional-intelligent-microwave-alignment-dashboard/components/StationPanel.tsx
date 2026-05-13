@@ -1,9 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StationData, OperationalMode } from '../types';
 
-
 /* ─────────────────────────────────────────────────────────────────────────────
-   Style injection — mirrors the HTML dashboard's CSS exactly
+   Style injection
 ───────────────────────────────────────────────────────────────────────────── */
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;500;700&display=swap');
@@ -16,8 +15,6 @@ const STYLES = `
     padding: 14px;
     color: #e2e8f0;
   }
-
-  /* ── header ── */
   .ma-station-header {
     display: flex;
     align-items: center;
@@ -31,8 +28,6 @@ const STYLES = `
     color: #e2e8f0;
   }
   .ma-header-right { display: flex; align-items: center; gap: 10px; }
-
-  /* ── RSSI value ── */
   .ma-rssi-val {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 22px;
@@ -42,8 +37,6 @@ const STYLES = `
   .ma-rssi-warn { color: #fbbf24; }
   .ma-rssi-bad  { color: #f87171; }
   .ma-rssi-none { color: #475569; }
-
-  /* ── badge ── */
   .ma-badge {
     font-family: 'Syne', sans-serif;
     font-size: 11px;
@@ -62,8 +55,6 @@ const STYLES = `
   }
   .ma-dot-on  { background: #4ade80; }
   .ma-dot-off { background: #f87171; }
-
-  /* ── angle gauges ── */
   .ma-gauge-row { display: flex; gap: 16px; margin-bottom: 14px; }
   .ma-gauge-wrap { flex: 1; text-align: center; }
   .ma-gauge-label {
@@ -77,8 +68,6 @@ const STYLES = `
   .ma-angle-bar-bg  { height: 5px; background: #1e2a4a; border-radius: 2px; overflow: hidden; }
   .ma-angle-bar-fill { height: 100%; background: #2563eb; border-radius: 2px; transition: width 0.4s ease; }
   .ma-sep { width: 1px; background: #1e2a4a; align-self: stretch; }
-
-  /* ── sliders ── */
   .ma-slider-row { margin-bottom: 10px; }
   .ma-slider-label {
     font-size: 10px; color: #475569; letter-spacing: 0.08em;
@@ -86,18 +75,10 @@ const STYLES = `
     display: flex; justify-content: space-between; align-items: center;
   }
   .ma-slider-val { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #60a5fa; }
-  .ma-slider {
-    width: 100%;
-    accent-color: #2563eb;
-    cursor: pointer;
-  }
+  .ma-slider { width: 100%; accent-color: #2563eb; cursor: pointer; }
   .ma-slider:disabled { opacity: 0.35; cursor: not-allowed; }
-
-  /* ── signal bar ── */
   .ma-sig-bar-bg { height: 4px; background: #1e2a4a; border-radius: 2px; overflow: hidden; margin: 10px 0 14px; }
   .ma-sig-bar-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
-
-  /* ── pending banner ── */
   .ma-pending {
     background: #0c1a3a;
     border: 1px solid #1d4ed8;
@@ -122,8 +103,6 @@ const STYLES = `
     flex-shrink: 0;
   }
   @keyframes ma-spin { to { transform: rotate(360deg); } }
-
-  /* ── error box ── */
   .ma-error-box {
     background: #1f0a0a;
     border: 1px solid #7f1d1d;
@@ -145,8 +124,6 @@ const STYLES = `
     transition: opacity 0.15s;
   }
   .ma-btn-reset:hover { opacity: 0.8; }
-
-  /* ── mode toggle ── */
   .ma-mode-toggle {
     display: flex;
     border: 1px solid #1e2a4a;
@@ -163,8 +140,6 @@ const STYLES = `
   .ma-mode-on  { background: #1d4ed8; color: #fff; }
   .ma-mode-off { background: transparent; color: #334155; }
   .ma-mode-off:not(:disabled):hover { color: #64748b; }
-
-  /* ── bottom row ── */
   .ma-bottom-row {
     display: flex;
     align-items: center;
@@ -184,43 +159,63 @@ const STYLES = `
   }
 
   /* ── signal history graph ── */
-  .ma-hist-wrap {
-    margin-bottom: 14px;
+  .ma-hist-wrap { margin-top: 14px; }
+  .ma-hist-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 5px;
   }
-  .ma-hist-label {
+  .ma-hist-title {
     font-size: 10px;
     color: #475569;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    margin-bottom: 6px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
   }
   .ma-hist-live {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 10px;
-    color: #334155;
+    color: #475569;
+  }
+  .ma-hist-canvas-wrap {
+    position: relative;
+    width: 100%;
+    height: 72px;
   }
   .ma-hist-canvas {
     display: block;
     width: 100%;
-    height: 56px;
+    height: 100%;
     border-radius: 3px;
     background: #060b18;
   }
-  .ma-hist-axis {
+  .ma-hist-yaxis {
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 2px 0;
+    pointer-events: none;
+  }
+  .ma-hist-ylabel {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 8px;
+    color: #1e3a5a;
+    line-height: 1;
+    padding-left: 3px;
+  }
+  .ma-hist-xaxis {
     display: flex;
     justify-content: space-between;
-    margin-top: 3px;
+    margin-top: 2px;
   }
-  .ma-hist-axis-val {
+  .ma-hist-xlabel {
     font-family: 'IBM Plex Mono', monospace;
-    font-size: 9px;
-    color: #1e2a4a;
+    font-size: 8px;
+    color: #1e3a5a;
   }
-
-  `;
+`;
 
 function injectStyles() {
   if (typeof document !== 'undefined' && !document.getElementById('ma-station-styles')) {
@@ -232,112 +227,99 @@ function injectStyles() {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   Signal history fetch hook
-   Pulls from GET /dashboard/position_signal_log/{station_id}?limit=40
-   Falls back to empty array on error — never blocks render.
+   Types for the time-series history
 ───────────────────────────────────────────────────────────────────────────── */
-const BASE_URL = 'http://192.168.100.14:8000';
-
-function useSignalHistory(stationId: string, online: boolean, liveRssi: number) {
-  const [history, setHistory] = useState<number[]>([]);
-
-  // Seed from position_signal_log on mount and every 5 s
-  useEffect(() => {
-    if (!online) return;
-
-    async function fetchHistory() {
-      try {
-        const res = await fetch(
-          `${BASE_URL}/dashboard/position_signal_log/${stationId}?limit=40`
-        );
-        if (!res.ok) return;
-        const data = await res.json();
-        const signals: number[] = (data.records ?? [])
-          .slice()
-          .reverse()
-          .map((r: any) => r.signal_dbm as number)
-          .filter((v: number) => v > -99);
-        setHistory(signals);
-      } catch {
-        // ignore
-      }
-    }
-
-    fetchHistory();
-    const id = setInterval(fetchHistory, 5000);
-    return () => clearInterval(id);
-  }, [stationId, online]);
-
-  // Append live RSSI from heartbeat every second so graph moves even when locked
-  useEffect(() => {
-    if (!online || !hasSignal(liveRssi)) return;
-
-    const id = setInterval(() => {
-      setHistory(prev => {
-        const next = [...prev, liveRssi];
-        return next.length > 60 ? next.slice(-60) : next;
-      });
-    }, 1500);
-
-    return () => clearInterval(id);
-  }, [online, liveRssi]);
-
-  return history;
+interface Sample {
+  ts: number;   // Date.now() ms
+  dbm: number;
 }
 
+const MAX_SAMPLES = 4500;  // keep last 120 points (~2 min at 1 s cadence)
+
 /* ─────────────────────────────────────────────────────────────────────────────
-   Signal history canvas — mirrors the HTML dashboard drawHist() exactly
+   Canvas draw — dBm vs wall-clock time
 ───────────────────────────────────────────────────────────────────────────── */
-function drawSignalHistory(
+function drawGraph(
   canvas: HTMLCanvasElement,
-  data: number[],
-  color: string
+  samples: Sample[],
+  lineColor: string,
 ) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  const w = canvas.width;
-  const h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
 
-  // Match HTML exactly: min=-75, max=-35
-  const min = -75;
-  const max = -35;
-  const range = max - min;
+  // Fixed dBm range
+  const DBM_MIN = -20;
+  const DBM_MAX = 1;
+  const DBM_RANGE = DBM_MAX - DBM_MIN;
 
-  // 4 grid lines at -70, -60, -50, -40 (same as HTML)
+  const toY = (dbm: number) =>
+    H - Math.max(0, Math.min(1, (dbm - DBM_MIN) / DBM_RANGE)) * H;
+
+  // ── grid lines at every 10 dBm ──────────────────────────────────────────
   ctx.strokeStyle = 'rgba(255,255,255,0.04)';
   ctx.lineWidth = 1;
-  [-70, -60, -50, -40].forEach(v => {
-    const y = h - ((v - min) / range) * h;
+  for (let v = DBM_MIN; v <= DBM_MAX; v += 10) {
+    const y = toY(v);
     ctx.beginPath();
     ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
+    ctx.lineTo(W, y);
     ctx.stroke();
-  });
+  }
 
-  if (data.length < 2) return;
+  if (samples.length < 2) return;
 
-  // Signal line only — no fill, matching HTML drawHist exactly
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
+  // ── time axis ────────────────────────────────────────────────────────────
+  const t0 = samples[0].ts;
+  const t1 = samples[samples.length - 1].ts;
+  const tRange = t1 - t0 || 1;
+  const toX = (ts: number) => ((ts - t0) / tRange) * W;
+
+  // ── subtle area fill ─────────────────────────────────────────────────────
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, lineColor + '22');
+  grad.addColorStop(1, lineColor + '00');
   ctx.beginPath();
-  data.forEach((v, i) => {
-    const x = (i / (data.length - 1)) * w;
-    const y = h - ((v - min) / range) * h;
+  samples.forEach((s, i) => {
+    const x = toX(s.ts);
+    const y = toY(s.dbm);
     if (i === 0) ctx.moveTo(x, y);
-    else         ctx.lineTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.lineTo(toX(samples[samples.length - 1].ts), H);
+  ctx.lineTo(toX(samples[0].ts), H);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // ── signal line ──────────────────────────────────────────────────────────
+  ctx.beginPath();
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  samples.forEach((s, i) => {
+    const x = toX(s.ts);
+    const y = toY(s.dbm);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   });
   ctx.stroke();
+
+  // ── dot at latest reading ────────────────────────────────────────────────
+  const last = samples[samples.length - 1];
+  ctx.beginPath();
+  ctx.arc(toX(last.ts), toY(last.dbm), 3, 0, Math.PI * 2);
+  ctx.fillStyle = lineColor;
+  ctx.fill();
 }
+
 /* ─────────────────────────────────────────────────────────────────────────────
    Helpers
 ───────────────────────────────────────────────────────────────────────────── */
-
-/** True when the backend has sent a real reading (anything above the -99 sentinel). */
-function hasSignal(rssi: number) {
-  return rssi > -99;
-}
+function hasSignal(rssi: number) { return rssi > -99; }
 
 function rssiClass(rssi: number) {
   if (!hasSignal(rssi)) return 'ma-rssi-none';
@@ -353,13 +335,11 @@ function rssiBarColor(rssi: number) {
   return '#f87171';
 }
 
-/** Maps -90 dBm → 0 %, -30 dBm → 100 %. Returns 0 when no reading. */
 function rssiPct(rssi: number) {
   if (!hasSignal(rssi)) return 0;
-  return Math.max(0, Math.min(100, ((rssi - -90) / (-30 - -90)) * 100));
+  return Math.max(0, Math.min(100, ((rssi - -90) / 60) * 100));
 }
 
-/** Link quality index: 0–100 derived from dBm. Shows "—" when no reading yet. */
 function lqiFromRssi(rssi: number): number | null {
   if (!hasSignal(rssi)) return null;
   return Math.min(100, Math.max(0, Math.round(110 + rssi)));
@@ -368,8 +348,13 @@ function lqiFromRssi(rssi: number): number | null {
 function azPct(az: number)  { return Math.min(100, Math.round((az / 180) * 100)); }
 function elPct(el: number)  { return Math.min(100, Math.round((el / 90)  * 100)); }
 
+function fmtTime(ts: number) {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
-   Default / fallback station shape
+   Default station
 ───────────────────────────────────────────────────────────────────────────── */
 const DEFAULT_STATION: StationData = {
   station_id: 'station_1',
@@ -399,48 +384,62 @@ const StationPanel: React.FC<StationPanelProps> = ({
 }) => {
   injectStyles();
 
-  const s: StationData = station ?? DEFAULT_STATION;
-
-  const online   = s.connection.online;
-  const rssi     = (s as any).signal_dbm ?? -99 as number;
+  const s = station ?? DEFAULT_STATION;
+  const online  = s.connection.online;
+  const rssi    = (s as any).signal_dbm ?? -99 as number;
 
   const [localAz, setLocalAz] = useState(s.current_angles.azimuth);
   const [localEl, setLocalEl] = useState(s.current_angles.elevation);
   const [isDragging, setIsDragging] = useState(false);
 
-  // ── Signal history ──────────────────────────────────────────────────────
+  // ── Time-series history ─────────────────────────────────────────────────
+  // Each entry is { ts: epoch-ms, dbm: number }.
+  // We append a new sample every time `rssi` changes to a valid value.
+  const samplesRef = useRef<Sample[]>([]);
+  const [samples, setSamples] = useState<Sample[]>([]);
+
+  // Append live RSSI every time the prop changes (parent polls backend)
+  useEffect(() => {
+    if (!hasSignal(rssi)) return;
+    const entry: Sample = { ts: Date.now(), dbm: rssi };
+    samplesRef.current = [...samplesRef.current, entry].slice(-MAX_SAMPLES);
+    setSamples([...samplesRef.current]);
+  }, [rssi]);  // fires on every new rssi value
+
+  // Append a sample on every parent poll — always advance the time axis,
+  // only skip if rssi is the no-signal sentinel
+  const prevRssiRef = useRef<number>(-99);
+  useEffect(() => {
+    if (!hasSignal(rssi)) return;
+    // Always push a new timestamped point so the x-axis scrolls forward
+    const entry: Sample = { ts: Date.now(), dbm: rssi };
+    samplesRef.current = [...samplesRef.current, entry].slice(-MAX_SAMPLES);
+    setSamples([...samplesRef.current]);
+    prevRssiRef.current = rssi;
+  });  // ← no dependency array: runs on every render, which happens every time parent re-renders with new data
+
+  // ── Canvas draw ─────────────────────────────────────────────────────────
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const history   = useSignalHistory(s.station_id, online, rssi);
+  const lineColor = s.station_id === 'station_1' ? '#2563eb' : '#16a34a';
 
-  // Colour matches HTML dashboard: station_1 → blue, others → green
-  const histColor = s.station_id === 'station_1' ? '#2563eb' : '#16a34a';
-
- // Set canvas pixel dimensions once after mount
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const setSize = () => {
-      const w = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 300;
-      if (canvas.width !== w) canvas.width = w;
-      canvas.height = 56;
-    };
-    setSize();
-    const ro = new ResizeObserver(setSize);
-    ro.observe(canvas);
-    return () => ro.disconnect();
-  }, []); // runs once only
 
-  // Redraw whenever history or color changes
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    if (canvas.width === 0) {
-      canvas.width = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 300;
-      canvas.height = 56;
+    function syncAndDraw() {
+      const parent = canvas!.parentElement;
+      const w = (parent?.offsetWidth || 300);
+      canvas!.width  = w;
+      canvas!.height = 72;
+      drawGraph(canvas!, samplesRef.current, lineColor);
     }
-    drawSignalHistory(canvas, history, histColor);
-  }, [history, histColor]);
 
+    syncAndDraw();
+
+    const ro = new ResizeObserver(syncAndDraw);
+    ro.observe(canvas.parentElement ?? canvas);
+    return () => ro.disconnect();
+  }, [samples, lineColor]);
 
   /* Sync angles from backend when user isn't dragging */
   useEffect(() => {
@@ -455,16 +454,6 @@ const StationPanel: React.FC<StationPanelProps> = ({
     sendManualCommand(s.station_id, localAz, localEl);
   }
 
-  /*
-   * RSSI source priority:
-   *   1. s.signal_dbm  — live value pushed by ESP32 heartbeat (backend v2)
-   *   2. -99           — sentinel meaning "no reading yet"; shown as N/A
-   *
-   * The old fallback `(s as any).telemetry?.rssi ?? -48` is removed because
-   * it silently masked missing data with a plausible-looking fake value.
-   */
-  
-
   const hasError = s.error.has_error;
   const pending  = s.command.pending;
   const isManual = s.mode === OperationalMode.MANUAL;
@@ -472,10 +461,13 @@ const StationPanel: React.FC<StationPanelProps> = ({
   const lqi      = lqiFromRssi(rssi);
   const displayName = s.station_id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
+  const firstTs = samples.length > 0 ? fmtTime(samples[0].ts) : null;
+  const lastTs  = samples.length > 0 ? fmtTime(samples[samples.length - 1].ts) : null;
+
   return (
     <div className="ma-card">
 
-      {/* ── Header ───────────────────────────────────────────────────────── */}
+      {/* ── Header ── */}
       <div className="ma-station-header">
         <span className="ma-station-name">{displayName}</span>
         <div className="ma-header-right">
@@ -489,7 +481,7 @@ const StationPanel: React.FC<StationPanelProps> = ({
         </div>
       </div>
 
-      {/* ── Azimuth / Elevation gauge bars ──────────────────────────────── */}
+      {/* ── Angle gauges ── */}
       <div className="ma-gauge-row">
         <div className="ma-gauge-wrap">
           <div className="ma-gauge-label">Azimuth</div>
@@ -508,22 +500,18 @@ const StationPanel: React.FC<StationPanelProps> = ({
         </div>
       </div>
 
-      
-
-      {/* ── Error banner ─────────────────────────────────────────────────── */}
+      {/* ── Error banner ── */}
       {hasError && (
         <div className="ma-error-box">
           <span className="ma-error-text">
             <span className="ma-error-label">FAULT DETECTED:</span>
             {(s.error as any).error_message ?? (s.error as any).message ?? 'Mechanical failure'}
           </span>
-          <button className="ma-btn-reset" onClick={() => resetError(s.station_id)}>
-            Reset
-          </button>
+          <button className="ma-btn-reset" onClick={() => resetError(s.station_id)}>Reset</button>
         </div>
       )}
 
-      {/* ── Pending command banner ───────────────────────────────────────── */}
+      {/* ── Pending banner ── */}
       {pending && (
         <div className="ma-pending">
           <span>
@@ -533,109 +521,98 @@ const StationPanel: React.FC<StationPanelProps> = ({
         </div>
       )}
 
-      {/* ── Manual sliders ───────────────────────────────────────────────── */}
+      {/* ── Sliders ── */}
       <div className="ma-slider-row">
         <div className="ma-slider-label">
           <span>Az</span>
           <span className="ma-slider-val">{localAz.toFixed(1)}°</span>
         </div>
-        <input
-          type="range" min={0} max={180} step={0.1}
-          value={localAz} disabled={disabled}
-          className="ma-slider"
+        <input type="range" min={0} max={180} step={0.1}
+          value={localAz} disabled={disabled} className="ma-slider"
           onMouseDown={() => setIsDragging(true)}
           onTouchStart={() => setIsDragging(true)}
           onChange={e => setLocalAz(parseFloat(e.target.value))}
-          onMouseUp={handleRelease}
-          onTouchEnd={handleRelease}
-        />
+          onMouseUp={handleRelease} onTouchEnd={handleRelease} />
       </div>
       <div className="ma-slider-row">
         <div className="ma-slider-label">
           <span>El</span>
           <span className="ma-slider-val">{localEl.toFixed(1)}°</span>
         </div>
-        <input
-          type="range" min={0} max={180} step={0.1}
-          value={localEl} disabled={disabled}
-          className="ma-slider"
+        <input type="range" min={0} max={180} step={0.1}
+          value={localEl} disabled={disabled} className="ma-slider"
           onMouseDown={() => setIsDragging(true)}
           onTouchStart={() => setIsDragging(true)}
           onChange={e => setLocalEl(parseFloat(e.target.value))}
-          onMouseUp={handleRelease}
-          onTouchEnd={handleRelease}
-        />
+          onMouseUp={handleRelease} onTouchEnd={handleRelease} />
       </div>
 
-      {/* ── RSSI signal bar ──────────────────────────────────────────────── */}
+      {/* ── RSSI bar ── */}
       <div className="ma-sig-bar-bg">
-        <div
-          className="ma-sig-bar-fill"
-          style={{ width: `${rssiPct(rssi)}%`, background: rssiBarColor(rssi) }}
-        />
+        <div className="ma-sig-bar-fill"
+          style={{ width: `${rssiPct(rssi)}%`, background: rssiBarColor(rssi) }} />
       </div>
 
-      {/* ── Bottom row: Mode toggle · LQI · Status ───────────────────────── */}
+      {/* ── Bottom row ── */}
       <div className="ma-bottom-row">
-
         <div>
           <div className="ma-meta-label">Mode</div>
           <div className="ma-mode-toggle" style={{ marginTop: 4 }}>
             {[OperationalMode.AUTO, OperationalMode.MANUAL].map(m => (
-              <button
-                key={m}
+              <button key={m}
                 className={`ma-mode-btn ${s.mode === m ? 'ma-mode-on' : 'ma-mode-off'}`}
                 disabled={!online || hasError}
-                onClick={() => setMode(m)}
-              >
+                onClick={() => setMode(m)}>
                 {m}
               </button>
             ))}
           </div>
         </div>
-
         <div style={{ textAlign: 'center' }}>
           <div className="ma-meta-label">Link quality</div>
           <div className="ma-lqi-val" style={{ color: lqi === null ? '#475569' : '#4ade80' }}>
             {lqi !== null ? lqi : '—'}
           </div>
         </div>
-
         <div style={{ textAlign: 'right' }}>
           <div className="ma-meta-label">Uptime</div>
           <div className="ma-status-val">
-            {hasError ? (
-              <span style={{ color: '#f87171' }}>Fault</span>
-            ) : online ? (
-              <span style={{ color: '#4ade80' }}>Running</span>
-            ) : (
-              <span style={{ color: '#64748b' }}>Offline</span>
-            )}
+            {hasError
+              ? <span style={{ color: '#f87171' }}>Fault</span>
+              : online
+                ? <span style={{ color: '#4ade80' }}>Running</span>
+                : <span style={{ color: '#64748b' }}>Offline</span>}
           </div>
         </div>
-            
       </div>
-      {/* ── Signal history graph ─────────────────────────────────────────── */}
-      <div className="ma-hist-wrap" style={{ marginTop: '14px' }}>
-        <div className="ma-hist-label">
-          <span>Signal history</span>
+
+      {/* ── Signal history graph — dBm vs time ── */}
+      <div className="ma-hist-wrap">
+        <div className="ma-hist-header">
+          <span className="ma-hist-title">
+            
+            Signal · dBm vs time 
+            
+            </span>
           <span className="ma-hist-live">
-            {history.length > 0
-              ? `${history[history.length - 1].toFixed(1)} dBm · ${history.length} pts`
-              : online ? 'waiting for data…' : 'offline'}
+            {samples.length > 0
+              ? `${samples[samples.length - 1].dbm.toFixed(1)} dBm · ${samples.length} pts`
+              : 'waiting…'}
           </span>
         </div>
-        <canvas
-          ref={canvasRef}
-          className="ma-hist-canvas"
-        />
-        <div className="ma-hist-axis">
-          <span className="ma-hist-axis-val">-75</span>
-          <span className="ma-hist-axis-val">-60</span>
-          <span className="ma-hist-axis-val">-45</span>
-          <span className="ma-hist-axis-val">-35 dBm</span>
+
+        <div className="ma-hist-canvas-wrap">
+          {/* y-axis labels */}
+          <canvas ref={canvasRef} className="ma-hist-canvas" />
+        </div>
+
+        {/* x-axis time labels */}
+        <div className="ma-hist-xaxis">
+          <span className="ma-hist-xlabel">{firstTs ?? '—'}</span>
+          <span className="ma-hist-xlabel">{lastTs ?? '—'}</span>
         </div>
       </div>
+
     </div>
   );
 };

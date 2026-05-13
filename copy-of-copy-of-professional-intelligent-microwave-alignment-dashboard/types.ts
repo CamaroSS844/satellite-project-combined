@@ -75,3 +75,13 @@ export interface TrendDataPoint {
   windSpeed_A: number;
   windSpeed_B: number;
 }
+
+
+// In your types file — add these fields to StationData
+export interface StationData {
+  // ... existing fields ...
+  optim_phase?:      string | null;   // "COARSE" | "REFINE" | "LOCK" | null
+  optim_converged?:  boolean | null;
+  optim_sweeping?:   boolean | null;
+  waiting_to_lock?:  boolean | null;
+}

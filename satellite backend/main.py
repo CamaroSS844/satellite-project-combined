@@ -43,11 +43,13 @@ SWEEP_AZ_START   = 10.0
 SWEEP_AZ_END     = 150.0
 SWEEP_EL_START   = 10.0
 SWEEP_EL_END     = 150.0
-SWEEP_AZ_STEP    = 70.0   # coarse grid spacing in degrees
-SWEEP_EL_STEP    = 70.0
-REDISCOVER_DROP_DBM   = 5.0    # dB drop triggers re-sweep
-RECAL_VARIANCE_THRESH = 3.0    # dBm² sustained variance triggers re-sweep
-RECAL_WINDOW          = 15     # how many recent samples to watch for instability
+SWEEP_AZ_STEP    = 20.0   # finer grid — 9x9 = ~49 waypoints, actually finds the peak
+SWEEP_EL_STEP    = 20.0
+REDISCOVER_DROP_DBM   = 10.0   # dB drop triggers re-sweep
+RECAL_VARIANCE_THRESH = 8.0    # dBm² sustained variance triggers re-sweep (wider tolerance)
+RECAL_WINDOW          = 30     # larger window smooths out transient spikes
+RECAL_SCHEDULED_SECS  = 120    # scheduled recal every 2 minutes regardless
+RECAL_MIN_SIGNAL_DBM  = -75.0  # only recal if signal is actually poor
 # ─────────────────────────────────────────────────────────────────────────
 
 LOG_LEVEL           = "STATE"  # OFF | ACCESS | STATE
@@ -145,10 +147,12 @@ class OptimSession(BaseModel):
     iteration:       int              = 0
     last_commanded:  Optional[Angles] = None
     converged:       bool             = False
-     # ── sweep fields ──────────────────────────────────────────────────────
+    locked_at:       Optional[float]  = None  # asyncio loop time when we locked
+    # ── sweep fields ──────────────────────────────────────────────────────
     sweep_queue:     List[List[float]] = []   # list of [az, el] waypoints
     sweeping:        bool              = False
     sweep_reason:    str               = ""
+    waiting_to_lock: bool             = False   # ← ADD THIS
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -943,6 +947,7 @@ def optimizer_check(station_id: str):
         sess.active    = False
         sess.converged = True
         sess.phase     = OptimPhase.LOCK
+        sess.locked_at = asyncio.get_event_loop().time()
         log_to_db(station_id,
                   f"Optimizer LOCKED — best AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
                   f"signal={sess.best_signal:.1f} dBm (variance={variance:.2f})", "INFO")
@@ -1279,32 +1284,65 @@ def download_pdf():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def optimizer_loop():
-    """
-    Autonomous alignment loop. States:
-      COARSE  → executing sweep_queue waypoints (boot sweep or recal sweep)
-      REFINE  → quadratic regression homing
-      LOCK    → holding; watching for disturbances
-    """
-    STEP_INTERVAL           = 4      # seconds between commands while refining
-    CHECK_INTERVAL          = 3      # seconds between convergence checks
-    LOCK_WATCH_INTERVAL     = 2      # seconds between disturbance checks while locked
-    MIN_SAMPLES_FOR_REFINE  = 6      # minimum samples before attempting regression
+    STEP_INTERVAL           = 4
+    CHECK_INTERVAL          = 3
+    LOCK_WATCH_INTERVAL     = 2
+    MIN_SAMPLES_FOR_REFINE  = 6
 
     step_timers:  Dict[str, float] = {}
     check_timers: Dict[str, float] = {}
     watch_timers: Dict[str, float] = {}
 
-    await asyncio.sleep(8)   # let stations connect and send first heartbeats
+    await asyncio.sleep(8)
 
     while True:
         now = asyncio.get_event_loop().time()
 
+        # ── CROSS-STATION HELPERS ─────────────────────────────────────────
+        all_ids = list(optim_sessions.keys())
+
+        def any_station_sweeping(exclude_id: str) -> bool:
+            """True if any OTHER station is still in COARSE sweep."""
+            return any(
+                s.sweeping and not s.converged and sid != exclude_id
+                for sid, s in optim_sessions.items()
+            )
+
+        def all_stations_ready_to_lock() -> bool:
+            """True when every station has converged OR is waiting to lock."""
+            return all(
+                s.converged or s.waiting_to_lock
+                for s in optim_sessions.values()
+            )
+
+        def force_recal_all(except_id: str, reason: str):
+            """Trigger a local recal sweep on every station except the one that initiated."""
+            for sid, s in optim_sessions.items():
+                if sid == except_id:
+                    continue
+                st = stations.get(sid)
+                if not st:
+                    continue
+                s.sweep_queue  = build_local_sweep(s.best_az, s.best_el,
+                                                   radius=20.0, step=10.0)
+                s.sweeping     = True
+                s.converged    = False
+                s.waiting_to_lock = False
+                s.active       = True
+                s.phase        = OptimPhase.COARSE
+                s.samples      = []
+                s.iteration    = 0
+                s.locked_at    = None
+                s.sweep_reason = f"sync recal (triggered by {except_id}: {reason})"
+                log_to_db(sid, f"Sync recal started — reason from {except_id}: {reason}", "WARN")
+
+        # ── PER-STATION LOOP ──────────────────────────────────────────────
         for station_id, sess in list(optim_sessions.items()):
             station = stations.get(station_id)
             if not station or station.mode != Mode.AUTO:
                 continue
 
-            # ── LOCKED: watch for disturbances ───────────────────────────
+            # ── LOCKED: watch for disturbances ────────────────────────────
             if sess.converged:
                 last_watch = watch_timers.get(station_id, 0)
                 if now - last_watch < LOCK_WATCH_INTERVAL:
@@ -1317,42 +1355,76 @@ async def optimizer_loop():
                 recent  = sess.samples[-RECAL_WINDOW:]
                 signals = [s.signal_dbm for s in recent]
                 current_signal = signals[-1]
-                variance = float(np.var(signals))
 
-                # Use rolling average of recent stable window as reference,
-                # NOT the frozen best_signal from the sweep — that prevents
-                # false triggers after signal naturally settles lower over time
-                rolling_avg = sum(signals) / len(signals)
-                drop_triggered     = current_signal < (rolling_avg - REDISCOVER_DROP_DBM)
-                variance_triggered = variance > RECAL_VARIANCE_THRESH
+                sorted_sigs   = sorted(signals)
+                median_signal = sorted_sigs[len(sorted_sigs) // 2]
+                variance      = float(np.var(signals))
 
-                if drop_triggered or variance_triggered:
+                last_5 = signals[-5:] if len(signals) >= 5 else signals
+                sustained_drop = all(
+                    s < (median_signal - REDISCOVER_DROP_DBM) for s in last_5
+                )
+                signal_is_poor = current_signal < RECAL_MIN_SIGNAL_DBM
+
+                locked_at = sess.locked_at or now
+                scheduled = (now - locked_at) >= RECAL_SCHEDULED_SECS
+                near_best = current_signal >= (sess.best_signal - 3.0)
+
+                if near_best:
+                    sess.locked_at = now
+                    continue
+
+                trigger = (sustained_drop and signal_is_poor) or scheduled
+                if trigger:
                     reason = (
-                        f"signal drop {current_signal:.1f} vs best {sess.best_signal:.1f} dBm"
-                        if drop_triggered
-                        else f"variance {variance:.2f} dBm² exceeds threshold"
+                        f"scheduled recal after {RECAL_SCHEDULED_SECS}s"
+                        if scheduled
+                        else f"sustained drop: last5={[round(x,1) for x in last_5]} median={median_signal:.1f} dBm"
                     )
-                    log_to_db(station_id, f"Disturbance detected ({reason}) — starting local recal sweep", "WARN")
+                    log_to_db(station_id, f"Recal triggered ({reason}) — syncing all stations", "WARN")
 
-                    # Local sweep around last known best — faster than full sweep
+                    # Recal THIS station
                     sess.sweep_queue  = build_local_sweep(sess.best_az, sess.best_el,
-                                                          radius=25.0, step=12.5)
+                                                          radius=20.0, step=10.0)
                     sess.sweeping     = True
                     sess.converged    = False
+                    sess.waiting_to_lock = False
                     sess.active       = True
                     sess.phase        = OptimPhase.COARSE
                     sess.samples      = []
                     sess.iteration    = 0
+                    sess.locked_at    = None
                     sess.sweep_reason = reason
-                continue   # handled above; skip refine logic
+
+                    # Force recal on ALL other stations simultaneously
+                    force_recal_all(station_id, reason)
+                continue
+
+            # ── WAITING TO LOCK: hold until all stations are ready ─────────
+            if sess.waiting_to_lock:
+                if all_stations_ready_to_lock():
+                    # Everyone is ready — lock all together
+                    for sid, s in optim_sessions.items():
+                        if s.waiting_to_lock or (s.converged and s.locked_at is None):
+                            s.waiting_to_lock = False
+                            s.active          = False
+                            s.converged       = True
+                            s.phase           = OptimPhase.LOCK
+                            s.locked_at       = now
+                            log_to_db(sid,
+                                      f"LOCKED (synchronized) — AZ={s.best_az:.1f} "
+                                      f"EL={s.best_el:.1f} signal={s.best_signal:.1f} dBm", "INFO")
+                else:
+                    log_to_db(station_id, "Waiting to lock — other stations still sweeping", "INFO")
+                continue
 
             if not sess.active:
                 continue
 
-            # ── COARSE: drain the sweep queue ────────────────────────────
+            # ── COARSE: drain the sweep queue ─────────────────────────────
             if sess.sweeping and sess.sweep_queue:
                 if station.command.pending:
-                    continue   # wait for ESP32 to finish current move
+                    continue
 
                 waypoint = sess.sweep_queue.pop(0)
                 target_az, target_el = waypoint[0], waypoint[1]
@@ -1371,18 +1443,22 @@ async def optimizer_loop():
                           f"[SWEEP] step={sess.iteration} → AZ={target_az} EL={target_el} "
                           f"remaining={remaining} reason='{sess.sweep_reason}'")
 
-                # Sweep finished — transition to REFINE
                 if not sess.sweep_queue:
                     sess.sweeping = False
                     sess.phase    = OptimPhase.REFINE
                     log_to_db(station_id,
-                              f"Sweep complete — {len(sess.samples)} samples collected, entering REFINE")
+                              f"Sweep complete — {len(sess.samples)} samples, entering REFINE")
                 continue
 
-            # ── REFINE: quadratic regression toward peak ──────────────────
+            # ── REFINE: block if any other station is still in COARSE ──────
+            if any_station_sweeping(station_id):
+                # Idle — don't issue refine commands until all stations reach REFINE
+                continue
+
+            # ── REFINE: quadratic regression toward peak ───────────────────
             last_step = step_timers.get(station_id, 0)
             if now - last_step < STEP_INTERVAL:
-                pass   # fall through to convergence check
+                pass
             elif not station.command.pending and len(sess.samples) >= MIN_SAMPLES_FOR_REFINE:
                 step_timers[station_id] = now
 
@@ -1425,7 +1501,7 @@ async def optimizer_loop():
                           f"[REFINE] step={sess.iteration} → AZ={target_az:.1f} EL={target_el:.1f} "
                           f"[{reason}] samples={len(sess.samples)}")
 
-            # ── CONVERGENCE CHECK ─────────────────────────────────────────
+            # ── CONVERGENCE CHECK ──────────────────────────────────────────
             last_check = check_timers.get(station_id, 0)
             if now - last_check >= CHECK_INTERVAL and len(sess.samples) >= 10:
                 check_timers[station_id] = now
@@ -1434,15 +1510,17 @@ async def optimizer_loop():
                 variance = float(np.var(signals))
 
                 if variance <= 1.5:
-                    sess.active    = False
-                    sess.converged = True
-                    sess.phase     = OptimPhase.LOCK
+                    # Don't lock yet — enter waiting room
+                    sess.waiting_to_lock = True
+                    sess.active          = False   # stop issuing refine commands
                     log_to_db(station_id,
-                              f"LOCKED — AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
-                              f"signal={sess.best_signal:.1f} dBm var={variance:.2f}", "INFO")
+                              f"Convergence reached — waiting for other stations "
+                              f"(AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
+                              f"signal={sess.best_signal:.1f} dBm var={variance:.2f})", "INFO")
 
         await asyncio.sleep(0.5)
 
+        
 async def heartbeat_monitor():
     while True:
         now = datetime.now(timezone.utc)
