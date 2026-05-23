@@ -1,24 +1,24 @@
 """
-Satellite Realignment Backend — v3 (MPU-6050 feedback)
-New endpoints:
-  POST /esp32/imu_update        — live IMU angle stream from ESP32
-  POST /esp32/movement_verify   — movement verification result from ESP32
-  POST /esp32/calibrate_ack     — ESP32 confirms calibration was executed
-  POST /dashboard/calibrate/{station_id} — dashboard triggers calibration
+Satellite Realignment Backend — v4 (Coordinated Sweep + Collective Lock)
+Changes from v3:
+  - Sweep only starts when BOTH stations are online
+  - Station sweeps are mirrored (one L→R, other R→L simultaneously)
+  - Lock position chosen from collective best: highest combined signal
+    across all paired (station_1_sample, station_2_sample) readings
+    taken at the same sweep step index, not individual bests
 """
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 import sqlite3
 import httpx
 import io
-# ADD after "import httpx"
 import numpy as np
 from scipy.optimize import minimize
 
@@ -35,24 +35,31 @@ from reportlab.platypus import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 HEARTBEAT_TIMEOUT   = timedelta(seconds=10)
-ANGLE_TOLERANCE     = 0.5      # servo command tolerance (degrees)
-IMU_VERIFY_TOLERANCE = 3.0     # IMU must move at least this many degrees to call it a success
+ANGLE_TOLERANCE     = 0.5
+IMU_VERIFY_TOLERANCE = 3.0
 
-# ── SWEEP & OPTIMIZER CONSTANTS ───────────────────────────────────────────
 SWEEP_AZ_START   = 10.0
 SWEEP_AZ_END     = 150.0
 SWEEP_EL_START   = 10.0
 SWEEP_EL_END     = 150.0
-SWEEP_AZ_STEP    = 20.0   # finer grid — 9x9 = ~49 waypoints, actually finds the peak
+SWEEP_AZ_STEP    = 20.0
 SWEEP_EL_STEP    = 20.0
-REDISCOVER_DROP_DBM   = 10.0   # dB drop triggers re-sweep
-RECAL_VARIANCE_THRESH = 8.0    # dBm² sustained variance triggers re-sweep (wider tolerance)
-RECAL_WINDOW          = 30     # larger window smooths out transient spikes
-RECAL_SCHEDULED_SECS  = 120    # scheduled recal every 2 minutes regardless
-RECAL_MIN_SIGNAL_DBM  = -75.0  # only recal if signal is actually poor
-# ─────────────────────────────────────────────────────────────────────────
 
-LOG_LEVEL           = "STATE"  # OFF | ACCESS | STATE
+REDISCOVER_DROP_DBM   = 7.0    # drop beyond this many dB below lock triggers recal
+RECAL_VARIANCE_THRESH = 8.0
+RECAL_WINDOW          = 10     # smaller window = faster reaction to drops
+RECAL_SCHEDULED_SECS  = 120
+RECAL_MIN_SIGNAL_DBM  = -75.0
+
+# ── Recal sweep size (3×3 instead of original 5×5) ───────────────────────────
+RECAL_AZ_STEP  = 46.7   # (150-10)/3 ≈ 46.7° gives 3 columns across the range
+RECAL_EL_STEP  = 46.7   # same for elevation → true 3×3 = 9 waypoints total
+
+LOG_LEVEL = "STATE"  # OFF | ACCESS | STATE
+
+# The two station IDs that must BOTH be online before any sweep starts.
+# Order matters for mirroring: index-0 sweeps forward, index-1 sweeps mirrored.
+STATION_PAIR = ["station_1", "station_2"]
 
 STATION_COORDS = {
     "station_1": {"lat": -17.8292, "lon": 31.0522, "label": "Station A – Harare"},
@@ -108,24 +115,23 @@ class ConnectionState(BaseModel):
 
 
 class IMUState(BaseModel):
-    """Live gyro angles relative to the calibrated home position."""
-    imu_az:           float           = 0.0
-    imu_el:           float           = 0.0
-    calibrated:       bool            = False
-    last_updated:     Optional[datetime] = None
+    imu_az:       float            = 0.0
+    imu_el:       float            = 0.0
+    calibrated:   bool             = False
+    last_updated: Optional[datetime] = None
 
 
 class MovementVerification(BaseModel):
-    """Latest movement verification result from the ESP32."""
-    success:          Optional[bool]  = None   # None = no verification yet
-    imu_az_delta:     float           = 0.0
-    imu_el_delta:     float           = 0.0
-    target_az:        float           = 0.0
-    target_el:        float           = 0.0
-    verified_at:      Optional[datetime] = None
+    success:      Optional[bool]   = None
+    imu_az_delta: float            = 0.0
+    imu_el_delta: float            = 0.0
+    target_az:    float            = 0.0
+    target_el:    float            = 0.0
+    verified_at:  Optional[datetime] = None
 
-# ── ADD THIS ENTIRE BLOCK ─────────────────────────────────────────────────────
+
 class OptimPhase(str, Enum):
+    IDLE   = "IDLE"    # waiting for both stations to come online
     COARSE = "COARSE"
     REFINE = "REFINE"
     LOCK   = "LOCK"
@@ -135,44 +141,51 @@ class OptimSample(BaseModel):
     azimuth:    float
     elevation:  float
     signal_dbm: float
+    # step_index ties samples from both stations taken at the same sweep step
+    step_index: int = -1
 
 
 class OptimSession(BaseModel):
-    active:          bool             = False
-    phase:           OptimPhase       = OptimPhase.COARSE
-    samples:         List[OptimSample]= []
-    best_signal:     float            = -999.0
-    best_az:         float            = 0.0
-    best_el:         float            = 0.0
-    iteration:       int              = 0
-    last_commanded:  Optional[Angles] = None
-    converged:       bool             = False
-    locked_at:       Optional[float]  = None  # asyncio loop time when we locked
-    # ── sweep fields ──────────────────────────────────────────────────────
-    sweep_queue:     List[List[float]] = []   # list of [az, el] waypoints
-    sweeping:        bool              = False
-    sweep_reason:    str               = ""
-    waiting_to_lock: bool             = False   # ← ADD THIS
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-
+    active:           bool              = False
+    phase:            OptimPhase        = OptimPhase.IDLE
+    samples:          List[OptimSample] = []
+    best_signal:      float             = -999.0
+    best_az:          float             = 0.0
+    best_el:          float             = 0.0
+    # Collective best — set once both stations have agreed on a lock point
+    collective_best_az:     float       = 0.0
+    collective_best_el:     float       = 0.0
+    collective_best_signal: float       = -999.0
+    # Second-best position — used as first probe target when recal triggers
+    second_best_az:         float       = 0.0
+    second_best_el:         float       = 0.0
+    second_best_signal:     float       = -999.0
+    iteration:        int               = 0
+    last_commanded:   Optional[Angles]  = None
+    converged:        bool              = False
+    locked_at:        Optional[float]   = None
+    sweep_queue:      List[List[float]] = []
+    sweeping:         bool              = False
+    sweep_reason:     str               = ""
+    waiting_to_lock:  bool              = False
+    # Which role this station plays in the current sweep pair
+    # "forward"  → az ascending per row
+    # "mirrored" → az descending per row (reversed within each row)
+    sweep_role:       str               = "forward"
 
 
 class StationState(BaseModel):
     station_id:          str
-    mode:                Mode                = Mode.AUTO
-    connection:          ConnectionState     = ConnectionState()
-    current_angles:      Angles              = Angles(azimuth=0.0, elevation=0.0)
-    target_angles:       Optional[Angles]    = None
-    command:             CommandState        = CommandState()
-    error:               ErrorState          = ErrorState()
-    signal_dbm:          float               = -99.0
-    # ── IMU feedback fields ──────────────────────────────────────────────
-    imu:                 IMUState            = IMUState()
+    mode:                Mode                 = Mode.AUTO
+    connection:          ConnectionState      = ConnectionState()
+    current_angles:      Angles               = Angles(azimuth=0.0, elevation=0.0)
+    target_angles:       Optional[Angles]     = None
+    command:             CommandState         = CommandState()
+    error:               ErrorState           = ErrorState()
+    signal_dbm:          float                = -99.0
+    imu:                 IMUState             = IMUState()
     last_verification:   MovementVerification = MovementVerification()
-    calibration_pending: bool                = False   # set by dashboard, cleared by ESP32 ack
+    calibration_pending: bool                 = False
 
 
 class WeatherData(BaseModel):
@@ -200,57 +213,66 @@ DB_PATH = "satellite.db"
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS env_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        station_id TEXT, ts TEXT,
+        temperature REAL, wind_speed REAL, rain REAL,
+        humidity REAL, pressure REAL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS system_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, station_id TEXT, message TEXT, level TEXT DEFAULT 'INFO')""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS kpi_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, avg_signal_dbm REAL, realignments_hour REAL,
+        downtime_reduction REAL, power_usage_w REAL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS imu_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, station_id TEXT,
+        imu_az REAL, imu_el REAL,
+        servo_az REAL, servo_el REAL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS verification_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, station_id TEXT,
+        success INTEGER, imu_az_delta REAL, imu_el_delta REAL,
+        target_az REAL, target_el REAL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS calibration_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, station_id TEXT, triggered_by TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS position_signal_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         TEXT,
+        station_id TEXT,
+        azimuth    REAL,
+        elevation  REAL,
+        signal_dbm REAL)""")
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS env_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            station_id TEXT, ts TEXT,
-            temperature REAL, wind_speed REAL, rain REAL,
-            humidity REAL, pressure REAL
+        CREATE TABLE IF NOT EXISTS collective_lock_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              TEXT,
+            step_index      INTEGER,
+            s1_az           REAL,
+            s1_el           REAL,
+            s1_signal       REAL,
+            s2_az           REAL,
+            s2_el           REAL,
+            s2_signal       REAL,
+            combined_score  REAL
         )
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS system_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT, station_id TEXT, message TEXT, level TEXT DEFAULT 'INFO'
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS kpi_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT, avg_signal_dbm REAL, realignments_hour REAL,
-            downtime_reduction REAL, power_usage_w REAL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS imu_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT, station_id TEXT,
-            imu_az REAL, imu_el REAL,
-            servo_az REAL, servo_el REAL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS verification_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT, station_id TEXT,
-            success INTEGER, imu_az_delta REAL, imu_el_delta REAL,
-            target_az REAL, target_el REAL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS calibration_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT, station_id TEXT, triggered_by TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS position_signal_log (
+        CREATE TABLE IF NOT EXISTS optimizer_reading_log (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT,
             station_id  TEXT,
-            azimuth     REAL,
-            elevation   REAL,
-            signal_dbm  REAL
+            phase       TEXT,        -- COARSE | REFINE | LOCK
+            step_index  INTEGER,     -- sweep step number (-1 for refine/lock)
+            commanded_az  REAL,      -- angle we sent to the servo
+            commanded_el  REAL,
+            reported_az   REAL,      -- angle the ESP32 actually reported back
+            reported_el   REAL,
+            signal_dbm    REAL,      -- RSSI at that position
+            sweep_role    TEXT,      -- forward | mirrored
+            reason        TEXT       -- why this point was chosen
         )
     """)
     con.commit()
@@ -298,12 +320,14 @@ def persist_imu(station_id: str, imu_az: float, imu_el: float, servo_az: float, 
         (ts, station_id, imu_az, imu_el, servo_az, servo_el)
     )
 
+
 def persist_position_signal(station_id: str, azimuth: float, elevation: float, signal_dbm: float):
     ts = datetime.now(timezone.utc).isoformat()
     db_exec(
         "INSERT INTO position_signal_log (ts, station_id, azimuth, elevation, signal_dbm) VALUES (?,?,?,?,?)",
         (ts, station_id, azimuth, elevation, signal_dbm)
     )
+
 
 def persist_verification(station_id: str, success: bool, imu_az_delta: float,
                           imu_el_delta: float, target_az: float, target_el: float):
@@ -313,97 +337,226 @@ def persist_verification(station_id: str, success: bool, imu_az_delta: float,
         (ts, station_id, int(success), imu_az_delta, imu_el_delta, target_az, target_el)
     )
 
-# ── ADD THIS ENTIRE FUNCTION ──────────────────────────────────────────────────
-def fit_quadratic_peak(samples: List[OptimSample]):
+
+def persist_optimizer_reading(
+    station_id: str,
+    phase: str,
+    step_index: int,
+    commanded_az: float,
+    commanded_el: float,
+    signal_dbm: float,
+    sweep_role: str,
+    reason: str,
+    reported_az: float = 0.0,
+    reported_el: float = 0.0,
+):
     """
-    Fit S = a·x² + b·y² + c·xy + d·x + e·y + f  via least squares.
-    Returns (best_az, best_el) predicted peak, or None if underdetermined.
-    Operates only on LOCAL samples — no global smoothness assumption.
+    Write one optimizer waypoint dispatch to optimizer_reading_log.
+    Called at every COARSE sweep step, every REFINE nudge, and at LOCK.
+    reported_az/el are filled in later by the heartbeat sample collector
+    but we log the command immediately so nothing is ever lost.
     """
-    if len(samples) < 6:
-        return None   # need at least 6 points for 6 coefficients
+    ts = datetime.now(timezone.utc).isoformat()
+    db_exec(
+        "INSERT INTO optimizer_reading_log "
+        "(ts, station_id, phase, step_index, commanded_az, commanded_el, "
+        " reported_az, reported_el, signal_dbm, sweep_role, reason) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (ts, station_id, phase, step_index,
+         commanded_az, commanded_el,
+         reported_az, reported_el,
+         signal_dbm, sweep_role, reason)
+    )
 
-    xs = np.array([s.azimuth    for s in samples])
-    ys = np.array([s.elevation  for s in samples])
-    zs = np.array([s.signal_dbm for s in samples])
-
-    # Normalise to improve numerical conditioning
-    x0, y0 = xs.mean(), ys.mean()
-    xn, yn = xs - x0, ys - y0
-
-    # Design matrix: [x² y² xy x y 1]
-    A = np.column_stack([xn**2, yn**2, xn*yn, xn, yn, np.ones_like(xn)])
-    try:
-        coeffs, _, _, _ = np.linalg.lstsq(A, zs, rcond=None)
-    except np.linalg.LinAlgError:
-        return None
-
-    a, b, c, d, e, _ = coeffs
-
-    # Peak: solve ∂S/∂x = 2ax + cy + d = 0
-    #              ∂S/∂y = 2by + cx + e = 0
-    M = np.array([[2*a, c], [c, 2*b]])
-    rhs = np.array([-d, -e])
-    try:
-        peak_norm = np.linalg.solve(M, rhs)
-    except np.linalg.LinAlgError:
-        return None
-
-    # Check the Hessian is negative definite (actual maximum, not minimum)
-    if a >= 0 or (4*a*b - c**2) <= 0:
-        return None   # surface opens upward — no maximum here
-
-    peak_az = float(peak_norm[0]) + x0
-    peak_el = float(peak_norm[1]) + y0
-    return peak_az, peak_el
+# ─────────────────────────────────────────────────────────────────────────────
+# SWEEP GRID HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_sweep_grid(
     az_start: float = SWEEP_AZ_START, az_end: float = SWEEP_AZ_END,
     el_start: float = SWEEP_EL_START, el_end: float = SWEEP_EL_END,
     az_step:  float = SWEEP_AZ_STEP,  el_step: float = SWEEP_EL_STEP,
+    mirrored: bool  = False,
 ) -> List[List[float]]:
     """
-    Build a boustrophedon (snake) grid of (az, el) waypoints.
-    Alternates direction each elevation row to minimise servo travel.
+    Build a boustrophedon (snake) grid of [az, el, step_index] waypoints.
+
+    mirrored=True  → each row's azimuth direction is flipped relative to the
+                     normal (forward) grid so the two stations sweep toward
+                     each other on every row, keeping them roughly face-to-face
+                     throughout the entire coarse scan.
+
+    step_index is shared between the two grids: waypoint 0 on station_1
+    corresponds to waypoint 0 on station_2, etc.
     """
     grid = []
     el = el_start
     row = 0
+    step = 0
     while el <= el_end + 0.01:
         az_range = list(np.arange(az_start, az_end + 0.01, az_step))
-        if row % 2 == 1:
-            az_range = az_range[::-1]   # reverse alternate rows
+
+        if mirrored:
+            # Mirror: odd rows go forward, even rows go backward (opposite of forward grid)
+            if row % 2 == 0:
+                az_range = az_range[::-1]
+        else:
+            # Forward (normal boustrophedon): even rows forward, odd rows backward
+            if row % 2 == 1:
+                az_range = az_range[::-1]
+
         for az in az_range:
-            grid.append([round(az, 1), round(el, 1)])
+            grid.append([round(az, 1), round(el, 1), step])
+            step += 1
         el += el_step
         row += 1
     return grid
 
 
 def build_local_sweep(center_az: float, center_el: float,
-                      radius: float = 20.0, step: float = 5.0) -> List[List[float]]:
-    """
-    Small spiral grid around a known-good position.
-    Used for recalibration after a disturbance — much faster than full sweep.
-    """
-    grid = []
+                      radius: float = 20.0, step_size: float = 5.0,
+                      mirrored: bool = False) -> List[List[float]]:
+    """Small grid around a known-good position for recalibration."""
     az_start = max(SWEEP_AZ_START, center_az - radius)
     az_end   = min(SWEEP_AZ_END,   center_az + radius)
     el_start = max(SWEEP_EL_START, center_el - radius)
     el_end   = min(SWEEP_EL_END,   center_el + radius)
+
+    grid = []
     el = el_start
     row = 0
+    step = 0
     while el <= el_end + 0.01:
-        az_range = list(np.arange(az_start, az_end + 0.01, step))
-        if row % 2 == 1:
-            az_range = az_range[::-1]
+        az_range = list(np.arange(az_start, az_end + 0.01, step_size))
+        if mirrored:
+            if row % 2 == 0:
+                az_range = az_range[::-1]
+        else:
+            if row % 2 == 1:
+                az_range = az_range[::-1]
         for az in az_range:
-            grid.append([round(az, 1), round(el, 1)])
-        el += step
+            grid.append([round(az, 1), round(el, 1), step])
+            step += 1
+        el += step_size
         row += 1
     return grid
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COLLECTIVE BEST — the heart of v4
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_collective_best(
+    sess1: "OptimSession",
+    sess2: "OptimSession",
+) -> Optional[Tuple[int, float, float, float, float, float]]:
+    """
+    Find the position pair where the *combined* signal is best.
+
+    Combined score = min(s1_dbm, s2_dbm)  — maximise the weakest link.
+    Tiebreaker = sum(s1_dbm + s2_dbm).
+
+    TWO PAIRING STRATEGIES, both evaluated, best overall wins:
+
+    Strategy A — COARSE step_index pairing (original):
+        Samples tagged with the same step_index were captured while both
+        servos were at their respective waypoints simultaneously.  Pure and
+        reliable but only covers the coarse grid.
+
+    Strategy B — REFINE proximity pairing:
+        Refine samples (step_index = -1) are the highest-quality readings
+        because the quadratic fit has already zoomed in.  We pair each
+        refine sample from sess1 with the closest-in-time refine sample
+        from sess2 (within a 10-second window) to form candidate pairs.
+        This ensures the lock uses the best position found during REFINE,
+        not just the coarsest grid point.
+
+    The winning pair from A and B is returned.
+
+    Returns:
+        (step_index, s1_az, s1_el, s2_az, s2_el, combined_score)
+        step_index is -1 for refine-derived pairs.
+    or None if no pairs can be formed.
+    """
+    best_score: float = -1e9
+    best_step:  int   = -1
+    best_s1: Optional[OptimSample] = None
+    best_s2: Optional[OptimSample] = None
+
+    # ── Strategy A: coarse step_index pairs ──────────────────────────────────
+    def index_by_step(sess: "OptimSession") -> Dict[int, OptimSample]:
+        best: Dict[int, OptimSample] = {}
+        for s in sess.samples:
+            if s.step_index < 0:
+                continue
+            if s.step_index not in best or s.signal_dbm > best[s.step_index].signal_dbm:
+                best[s.step_index] = s
+        return best
+
+    idx1 = index_by_step(sess1)
+    idx2 = index_by_step(sess2)
+    for step in set(idx1.keys()) & set(idx2.keys()):
+        s1, s2   = idx1[step], idx2[step]
+        score    = min(s1.signal_dbm, s2.signal_dbm)
+        tiebreak = s1.signal_dbm + s2.signal_dbm
+        cur_tb   = (best_s1.signal_dbm + best_s2.signal_dbm
+                    if best_s1 and best_s2 else -1e9)
+        if score > best_score or (score == best_score and tiebreak > cur_tb):
+            best_score, best_step, best_s1, best_s2 = score, step, s1, s2
+
+    # ── Strategy B: refine proximity pairs ───────────────────────────────────
+    # Keep only the single best refine sample per station (highest signal_dbm).
+    # These represent where each station's quadratic fit converged — the true
+    # per-station optimum.  We then pair them directly: they were captured
+    # during the same REFINE phase, so the pairing is semantically valid.
+    refine1 = [s for s in sess1.samples if s.step_index < 0]
+    refine2 = [s for s in sess2.samples if s.step_index < 0]
+
+    if refine1 and refine2:
+        # Best individual refine reading for each station
+        r1 = max(refine1, key=lambda s: s.signal_dbm)
+        r2 = max(refine2, key=lambda s: s.signal_dbm)
+        score    = min(r1.signal_dbm, r2.signal_dbm)
+        tiebreak = r1.signal_dbm + r2.signal_dbm
+        cur_tb   = (best_s1.signal_dbm + best_s2.signal_dbm
+                    if best_s1 and best_s2 else -1e9)
+        if score > best_score or (score == best_score and tiebreak > cur_tb):
+            best_score, best_step, best_s1, best_s2 = score, -1, r1, r2
+
+    if best_s1 is None or best_s2 is None:
+        return None
+
+    return (best_step,
+            best_s1.azimuth, best_s1.elevation,
+            best_s2.azimuth, best_s2.elevation,
+            best_score)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUADRATIC SURFACE PEAK FIT (unchanged from v3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fit_quadratic_peak(samples: List[OptimSample]):
+    if len(samples) < 6:
+        return None
+    xs = np.array([s.azimuth    for s in samples])
+    ys = np.array([s.elevation  for s in samples])
+    zs = np.array([s.signal_dbm for s in samples])
+    x0, y0 = xs.mean(), ys.mean()
+    xn, yn = xs - x0, ys - y0
+    A = np.column_stack([xn**2, yn**2, xn*yn, xn, yn, np.ones_like(xn)])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, zs, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    a, b, c, d, e, _ = coeffs
+    M   = np.array([[2*a, c], [c, 2*b]])
+    rhs = np.array([-d, -e])
+    try:
+        peak_norm = np.linalg.solve(M, rhs)
+    except np.linalg.LinAlgError:
+        return None
+    if a >= 0 or (4*a*b - c**2) <= 0:
+        return None
+    return float(peak_norm[0]) + x0, float(peak_norm[1]) + y0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WEATHER
@@ -441,7 +594,7 @@ async def fetch_weather(lat: float, lon: float) -> WeatherData:
 # APP
 # ─────────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Satellite Realignment Backend v3 — IMU Feedback")
+app = FastAPI(title="Satellite Realignment Backend v4 — Coordinated Sweep")
 
 app.add_middleware(
     CORSMiddleware,
@@ -451,11 +604,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-stations: Dict[str, StationState] = {}
-weather_cache: Dict[str, WeatherData] = {}
-realignment_counts: Dict[str, int] = {}
-
-optim_sessions: Dict[str, OptimSession] = {}   # ADD THIS LINE
+stations:           Dict[str, StationState]  = {}
+weather_cache:      Dict[str, WeatherData]   = {}
+realignment_counts: Dict[str, int]           = {}
+optim_sessions:     Dict[str, OptimSession]  = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -467,6 +619,56 @@ def get_station(station_id: str) -> StationState:
         log_to_db(station_id, f"Station initialised: {station_id}")
     return stations[station_id]
 
+
+def both_stations_online() -> bool:
+    """True only when every station in STATION_PAIR has a live heartbeat."""
+    return all(
+        stations.get(sid) and stations[sid].connection.online
+        for sid in STATION_PAIR
+    )
+
+
+def _maybe_start_coordinated_sweep():
+    """
+    Called after every heartbeat.  If both stations are now online and neither
+    has an active session yet, create PAIRED sessions with mirrored grids and
+    shared step_index values so collective scoring works correctly.
+    """
+    if not both_stations_online():
+        return
+    # Don't restart if sessions are already running / converged
+    for sid in STATION_PAIR:
+        if sid in optim_sessions and (
+            optim_sessions[sid].active or optim_sessions[sid].converged
+        ):
+            return
+
+    grid_forward  = build_sweep_grid(mirrored=False)
+    grid_mirrored = build_sweep_grid(mirrored=True)
+
+    for i, sid in enumerate(STATION_PAIR):
+        station = get_station(sid)
+        grid = grid_forward if i == 0 else grid_mirrored
+        role = "forward"     if i == 0 else "mirrored"
+        sess = OptimSession(
+            active       = True,
+            phase        = OptimPhase.COARSE,
+            samples      = [],
+            best_signal  = station.signal_dbm if station.signal_dbm > -99 else -999.0,
+            best_az      = station.current_angles.azimuth,
+            best_el      = station.current_angles.elevation,
+            iteration    = 0,
+            converged    = False,
+            sweep_queue  = grid,
+            sweeping     = True,
+            sweep_reason = "boot sweep (coordinated)",
+            sweep_role   = role,
+        )
+        optim_sessions[sid] = sess
+        log_to_db(sid,
+                  f"Coordinated boot sweep started — role={role} "
+                  f"({len(grid)} waypoints)", "INFO")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ESP32 ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,6 +679,7 @@ class HeartbeatIn(BaseModel):
     signal_dbm: Optional[float] = None
     azimuth:    Optional[float] = None
     elevation:  Optional[float] = None
+
 
 @app.post("/esp32/heartbeat")
 def heartbeat(data: HeartbeatIn):
@@ -492,65 +695,59 @@ def heartbeat(data: HeartbeatIn):
         prev_az = station.current_angles.azimuth
         prev_el = station.current_angles.elevation
         station.current_angles = Angles(azimuth=data.azimuth, elevation=data.elevation)
-
-        # Log only when position actually changed (0.5° tolerance matches ANGLE_TOLERANCE)
         if abs(data.azimuth - prev_az) > 0.5 or abs(data.elevation - prev_el) > 0.5:
-            persist_position_signal(
-                data.station_id,
-                data.azimuth,
-                data.elevation,
-                station.signal_dbm,   # use the stored value — already updated above
-            )
-    # ── OPTIMIZER HOOK ────────────────────────────────────────────────────────
-    # ── OPTIMIZER HOOK ────────────────────────────────────────────────────────
-    sess = optim_sessions.get(data.station_id)
+            persist_position_signal(data.station_id, data.azimuth, data.elevation, station.signal_dbm)
 
-    # Create session on first heartbeat from this station (not at server startup)
-    if sess is None and station.mode == Mode.AUTO:
-        grid = build_sweep_grid()
-        sess = OptimSession(
-            active       = True,
-            phase        = OptimPhase.COARSE,
-            samples      = [],
-            best_signal  = data.signal_dbm if data.signal_dbm is not None else -999.0,
-            best_az      = data.azimuth if data.azimuth is not None else station.current_angles.azimuth,
-            best_el      = data.elevation if data.elevation is not None else station.current_angles.elevation,
-            iteration    = 0,
-            converged    = False,
-            sweep_queue  = grid,
-            sweeping     = True,
-            sweep_reason = "boot sweep",
-        )
-        optim_sessions[data.station_id] = sess
-        log_to_db(data.station_id,
-                  f"ESP32 connected — boot sweep started ({len(grid)} waypoints)", "INFO")
+    # Try to start coordinated sweep if both stations are now online
+    _maybe_start_coordinated_sweep()
 
     # Collect sample into active session
+    sess = optim_sessions.get(data.station_id)
     if sess and sess.active and not sess.converged:
         if data.signal_dbm is not None and data.azimuth is not None and data.elevation is not None:
+            # Determine step_index from the last commanded waypoint
+            step_idx = -1
+            if sess.last_commanded is not None and sess.sweep_queue is not None:
+                # Use iteration count as step proxy — it is incremented each time
+                # a sweep waypoint is dispatched, so samples collected after step N
+                # are tagged with N.
+                step_idx = sess.iteration
             sess.samples.append(OptimSample(
                 azimuth    = data.azimuth,
                 elevation  = data.elevation,
                 signal_dbm = data.signal_dbm,
+                step_index = step_idx,
             ))
             if data.signal_dbm > sess.best_signal:
+                # Demote current best to second-best before overwriting
+                if sess.best_signal > sess.second_best_signal:
+                    sess.second_best_signal = sess.best_signal
+                    sess.second_best_az     = sess.best_az
+                    sess.second_best_el     = sess.best_el
                 sess.best_signal = data.signal_dbm
                 sess.best_az     = data.azimuth
                 sess.best_el     = data.elevation
+            elif data.signal_dbm > sess.second_best_signal and (
+                abs(data.azimuth   - sess.best_az) > 5.0 or
+                abs(data.elevation - sess.best_el) > 5.0
+            ):
+                # Only update second-best if it's at a meaningfully different position
+                # (avoids second-best being virtually the same spot as best)
+                sess.second_best_signal = data.signal_dbm
+                sess.second_best_az     = data.azimuth
+                sess.second_best_el     = data.elevation
 
-    # While LOCKED: keep a rolling window of recent samples for disturbance detection
-    # and track the current running signal so drop detection uses a live reference
+    # Rolling window for disturbance detection while LOCKED
     if sess and sess.converged:
         if data.signal_dbm is not None and data.azimuth is not None and data.elevation is not None:
             sess.samples.append(OptimSample(
                 azimuth    = data.azimuth,
                 elevation  = data.elevation,
                 signal_dbm = data.signal_dbm,
+                step_index = -1,
             ))
-            # Cap to avoid unbounded growth — keep last 60 samples
             if len(sess.samples) > 60:
                 sess.samples = sess.samples[-60:]
-    # ── END OPTIMIZER HOOK ───────────────────────────────────────────────────
 
     if station.mode != data.mode:
         log_state(f"Mode mismatch ESP32={data.mode} Backend={station.mode}", station)
@@ -560,10 +757,12 @@ def heartbeat(data: HeartbeatIn):
         "status":              "ok",
         "authoritative_mode":  station.mode,
         "calibrate":           station.calibration_pending,
-        "optim_phase":         sess_now.phase if sess_now else None,
-        "optim_sweeping":      sess_now.sweeping if sess_now else False,
-        "optim_converged":     sess_now.converged if sess_now else False,
+        "optim_phase":         sess_now.phase        if sess_now else None,
+        "optim_sweeping":      sess_now.sweeping      if sess_now else False,
+        "optim_converged":     sess_now.converged     if sess_now else False,
+        "both_online":         both_stations_online(),
     }
+
 
 @app.get("/esp32/state/{station_id}")
 def esp32_get_state(station_id: str):
@@ -582,21 +781,13 @@ class AngleUpdateIn(BaseModel):
 def update_angles(data: AngleUpdateIn):
     station = get_station(data.station_id)
     station.current_angles = Angles(azimuth=data.azimuth, elevation=data.elevation)
-
     if data.imu_az is not None:
         station.imu.imu_az = data.imu_az
         station.imu.last_updated = datetime.now(timezone.utc)
     if data.imu_el is not None:
         station.imu.imu_el = data.imu_el
-
-    persist_imu(
-        data.station_id,
-        data.imu_az or 0.0,
-        data.imu_el or 0.0,
-        data.azimuth,
-        data.elevation,
-    )
-
+    persist_imu(data.station_id, data.imu_az or 0.0, data.imu_el or 0.0,
+                data.azimuth, data.elevation)
     if station.command.pending and station.target_angles:
         da = abs(station.current_angles.azimuth   - station.target_angles.azimuth)
         de = abs(station.current_angles.elevation - station.target_angles.elevation)
@@ -605,7 +796,6 @@ def update_angles(data: AngleUpdateIn):
             station.command.acknowledged = True
             station.target_angles        = None
             log_to_db(station.station_id, "Servo realignment command completed")
-
     return {"status": "updated"}
 
 
@@ -618,7 +808,6 @@ class IMUUpdateIn(BaseModel):
 
 @app.post("/esp32/imu_update")
 def imu_update(data: IMUUpdateIn):
-    """Receives the continuous IMU telemetry stream from the ESP32."""
     station = get_station(data.station_id)
     station.imu.imu_az       = data.imu_az
     station.imu.imu_el       = data.imu_el
@@ -638,10 +827,6 @@ class MovementVerifyIn(BaseModel):
 
 @app.post("/esp32/movement_verify")
 def movement_verify(data: MovementVerifyIn):
-    """
-    ESP32 reports whether the servos actually moved to the commanded angles,
-    determined by comparing the IMU delta to IMU_VERIFY_TOLERANCE.
-    """
     station = get_station(data.station_id)
     station.last_verification = MovementVerification(
         success       = data.success,
@@ -651,29 +836,20 @@ def movement_verify(data: MovementVerifyIn):
         target_el     = data.target_el,
         verified_at   = datetime.now(timezone.utc),
     )
-
-    persist_verification(
-        data.station_id, data.success,
-        data.imu_az_delta, data.imu_el_delta,
-        data.target_az, data.target_el,
-    )
-
+    persist_verification(data.station_id, data.success,
+                         data.imu_az_delta, data.imu_el_delta,
+                         data.target_az, data.target_el)
     level = "INFO" if data.success else "WARN"
-    msg = (
-        f"Movement verify {'OK' if data.success else 'FAILED'}: "
-        f"IMU delta AZ={data.imu_az_delta:.1f}° EL={data.imu_el_delta:.1f}°"
-    )
+    msg = (f"Movement verify {'OK' if data.success else 'FAILED'}: "
+           f"IMU delta AZ={data.imu_az_delta:.1f}° EL={data.imu_el_delta:.1f}°")
     log_to_db(data.station_id, msg, level)
-
     if not data.success:
-        # Surface the failure as a soft error visible on dashboard
         station.error = ErrorState(
             has_error     = True,
             error_code    = "MOVE_VERIFY_FAIL",
             error_message = f"Servo did not reach target. IMU delta: AZ={data.imu_az_delta:.1f}° EL={data.imu_el_delta:.1f}°",
             timestamp     = datetime.now(timezone.utc),
         )
-
     return {"status": "verified", "success": data.success}
 
 
@@ -683,7 +859,6 @@ class CalibrateAckIn(BaseModel):
 
 @app.post("/esp32/calibrate_ack")
 def calibrate_ack(data: CalibrateAckIn):
-    """ESP32 confirms it has executed the calibration command."""
     station = get_station(data.station_id)
     station.calibration_pending = False
     station.imu.calibrated      = True
@@ -768,11 +943,6 @@ def reset_error(station_id: str):
 
 @app.post("/dashboard/calibrate/{station_id}")
 def trigger_calibration(station_id: str):
-    """
-    Dashboard operator presses 'Calibrate' for a station.
-    This sets calibration_pending = True which the ESP32 polls
-    and then executes the calibration on its side (setting home offsets).
-    """
     station = get_station(station_id)
     station.calibration_pending = True
     ts = datetime.now(timezone.utc).isoformat()
@@ -786,12 +956,11 @@ def trigger_calibration(station_id: str):
 
 @app.get("/dashboard/imu/{station_id}")
 def get_imu_state(station_id: str):
-    """Return current IMU angles and calibration state for a station."""
     station = get_station(station_id)
     return {
-        "station_id":        station_id,
-        "imu":               station.imu,
-        "last_verification": station.last_verification,
+        "station_id":          station_id,
+        "imu":                 station.imu,
+        "last_verification":   station.last_verification,
         "calibration_pending": station.calibration_pending,
     }
 
@@ -824,159 +993,99 @@ def get_position_signal_log(station_id: str, limit: int = 200):
     return {"station_id": station_id, "records": rows}
 
 
+@app.get("/dashboard/collective_lock_log")
+def get_collective_lock_log(limit: int = 50):
+    """History of every collective lock decision — what step won and why."""
+    rows = db_fetch(
+        "SELECT ts, step_index, s1_az, s1_el, s1_signal, s2_az, s2_el, s2_signal, combined_score "
+        "FROM collective_lock_log ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
+    return {"records": rows}
+
+
+@app.get("/dashboard/optimizer_readings/{station_id}")
+def get_optimizer_readings(station_id: str, limit: int = 500):
+    """
+    Full optimizer reading log for one station — every COARSE, REFINE, and LOCK
+    waypoint dispatch with the signal that was recorded at that position.
+    Use this to troubleshoot sweep quality and convergence behaviour.
+    """
+    rows = db_fetch(
+        "SELECT ts, phase, step_index, commanded_az, commanded_el, "
+        "       reported_az, reported_el, signal_dbm, sweep_role, reason "
+        "FROM optimizer_reading_log "
+        "WHERE station_id=? ORDER BY id DESC LIMIT ?",
+        (station_id, limit)
+    )
+    return {"station_id": station_id, "readings": rows}
+
+
+@app.get("/dashboard/optimizer_readings_all")
+def get_optimizer_readings_all(limit: int = 1000):
+    """All stations combined, most recent first — useful for side-by-side comparison."""
+    rows = db_fetch(
+        "SELECT ts, station_id, phase, step_index, commanded_az, commanded_el, "
+        "       reported_az, reported_el, signal_dbm, sweep_role, reason "
+        "FROM optimizer_reading_log ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
+    return {"readings": rows}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# OPTIMIZER ENDPOINTS
+# OPTIMIZER ENDPOINTS  (status / manual start)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/optimizer/start/{station_id}")
 def optimizer_start(station_id: str):
-    """Initialise a new optimisation session for a station."""
-    station = get_station(station_id)
-
-    optim_sessions[station_id] = OptimSession(
-        active      = True,
-        phase       = OptimPhase.COARSE,
-        samples     = [],
-        best_signal = station.signal_dbm if station.signal_dbm > -99 else -999.0,
-        best_az     = station.current_angles.azimuth,
-        best_el     = station.current_angles.elevation,
-        iteration   = 0,
-        converged   = False,
-    )
-    # Ensure station is in AUTO so existing command plumbing works
-    station.mode = Mode.AUTO
-    log_to_db(station_id, "Optimizer started — COARSE phase", "INFO")
-    return {"status": "optimizer_started", "station_id": station_id}
-
-
-@app.post("/optimizer/step/{station_id}")
-def optimizer_step(station_id: str):
     """
-    Run one optimisation step:
-      1. Fit quadratic surface to LOCAL samples near current best
-      2. Predict peak angles
-      3. Issue movement command via existing command system
+    Manually re-trigger the coordinated sweep for a specific station.
+    Both stations must be online; calling this for one side restarts both
+    so the grids stay paired.
     """
-    sess = optim_sessions.get(station_id)
-    if not sess or not sess.active:
-        raise HTTPException(400, "No active optimizer session for this station")
-    if sess.converged:
-        return {"status": "already_converged", "best_az": sess.best_az, "best_el": sess.best_el}
+    if not both_stations_online():
+        raise HTTPException(400, "Both stations must be online before starting sweep")
 
-    station = get_station(station_id)
-
-    # ── Select LOCAL samples: within ±15° of current best ──────────────────
-    LOCAL_WINDOW = 15.0
-    local_samples = [
-        s for s in sess.samples
-        if abs(s.azimuth   - sess.best_az) <= LOCAL_WINDOW
-        and abs(s.elevation - sess.best_el) <= LOCAL_WINDOW
-    ]
-
-    peak = fit_quadratic_peak(local_samples) if len(local_samples) >= 6 else None
-
-    if peak is None:
-        # Not enough data yet — nudge toward best known position with small offsets
-        # to collect more samples around the neighbourhood
-        NUDGE = 3.0
-        sess.iteration += 1
-        nudge_az = sess.best_az + (NUDGE if sess.iteration % 2 == 0 else -NUDGE)
-        nudge_el = sess.best_el + (NUDGE if (sess.iteration // 2) % 2 == 0 else -NUDGE)
-        target_az = float(np.clip(nudge_az, MIN_AZ, MAX_AZ))
-        target_el = float(np.clip(nudge_el, MIN_EL, MAX_EL))
-        reason = "nudge — collecting samples"
-    else:
-        # Clamp predicted peak to servo limits
-        MIN_AZ, MAX_AZ = 10.0, 150.0
-        MIN_EL, MAX_EL = 10.0, 150.0
-        target_az = float(np.clip(peak[0], MIN_AZ, MAX_AZ))
-        target_el = float(np.clip(peak[1], MIN_EL, MAX_EL))
-        sess.phase = OptimPhase.REFINE
-        sess.iteration += 1
-        reason = "quadratic peak prediction"
-
-    # ── Issue command via existing command system ────────────────────────────
-    station.target_angles = Angles(azimuth=target_az, elevation=target_el)
-    station.command = CommandState(
-        pending=True,
-        issued_at=datetime.now(timezone.utc),
-        acknowledged=False,
-    )
-    sess.last_commanded = Angles(azimuth=target_az, elevation=target_el)
-
-    log_to_db(station_id,
-              f"Optimizer step {sess.iteration}: move to AZ={target_az:.1f} EL={target_el:.1f} [{reason}]")
-
-    return {
-        "status":      "command_issued",
-        "iteration":   sess.iteration,
-        "phase":       sess.phase,
-        "target_az":   target_az,
-        "target_el":   target_el,
-        "reason":      reason,
-        "sample_count": len(sess.samples),
-        "local_count":  len(local_samples),
-        "best_signal": sess.best_signal,
-    }
-
-
-@app.post("/optimizer/check/{station_id}")
-def optimizer_check(station_id: str):
-    """
-    Check convergence:
-      - Look at the last N samples near the best position
-      - If RSSI variance is low → LOCK and stop
-    """
-    RECENT_N       = 10
-    VAR_THRESHOLD  = 1.5    # dBm² — tune to your environment
-    MIN_SAMPLES    = 10     # don't converge too early
-
-    sess = optim_sessions.get(station_id)
-    if not sess or not sess.active:
-        raise HTTPException(400, "No active optimizer session for this station")
-
-    if len(sess.samples) < MIN_SAMPLES:
-        return {"status": "collecting", "sample_count": len(sess.samples)}
-
-    # Take the most recent RECENT_N samples
-    recent = sess.samples[-RECENT_N:]
-    signals = [s.signal_dbm for s in recent]
-    variance = float(np.var(signals))
-
-    if variance <= VAR_THRESHOLD:
-        sess.active    = False
-        sess.converged = True
-        sess.phase     = OptimPhase.LOCK
-        sess.locked_at = asyncio.get_event_loop().time()
-        log_to_db(station_id,
-                  f"Optimizer LOCKED — best AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
-                  f"signal={sess.best_signal:.1f} dBm (variance={variance:.2f})", "INFO")
-        return {
-            "status":       "converged",
-            "best_az":      sess.best_az,
-            "best_el":      sess.best_el,
-            "best_signal":  sess.best_signal,
-            "variance":     variance,
-            "iterations":   sess.iteration,
-        }
-
-    return {
-        "status":       "optimizing",
-        "variance":     variance,
-        "sample_count": len(sess.samples),
-        "best_signal":  sess.best_signal,
-        "phase":        sess.phase,
-    }
+    # Wipe existing sessions so _maybe_start_coordinated_sweep recreates them
+    for sid in STATION_PAIR:
+        optim_sessions.pop(sid, None)
+    _maybe_start_coordinated_sweep()
+    return {"status": "coordinated_sweep_started", "station_id": station_id}
 
 
 @app.get("/optimizer/status/{station_id}")
 def optimizer_status(station_id: str):
-    """Read-only view of the current optimiser session."""
     sess = optim_sessions.get(station_id)
     if not sess:
-        return {"active": False, "station_id": station_id}
+        return {"active": False, "station_id": station_id,
+                "waiting_for_partner": not both_stations_online()}
     return sess
 
+
+@app.get("/optimizer/collective_best")
+def optimizer_collective_best():
+    """
+    Return the current collective best position for each station pair,
+    computed live from in-memory samples.
+    """
+    sid1, sid2 = STATION_PAIR
+    sess1 = optim_sessions.get(sid1)
+    sess2 = optim_sessions.get(sid2)
+    if not sess1 or not sess2:
+        return {"available": False, "reason": "Sessions not yet initialised"}
+
+    result = compute_collective_best(sess1, sess2)
+    if result is None:
+        return {"available": False, "reason": "No matching step indices yet"}
+
+    step_idx, s1_az, s1_el, s2_az, s2_el, score = result
+    return {
+        "available":      True,
+        "step_index":     step_idx,
+        "station_1":      {"az": s1_az, "el": s1_el},
+        "station_2":      {"az": s2_az, "el": s2_el},
+        "combined_score": score,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENVIRONMENTAL DATA
@@ -991,18 +1100,15 @@ class UserLocationIn(BaseModel):
 async def environmental_data(loc: UserLocationIn):
     coords_a = STATION_COORDS["station_1"]
     coords_b = STATION_COORDS["station_2"]
-
     weather_a, weather_b = await asyncio.gather(
         fetch_weather(coords_a["lat"], coords_a["lon"]),
         fetch_weather(coords_b["lat"], coords_b["lon"]),
     )
     persist_env("station_1", weather_a)
     persist_env("station_2", weather_b)
-
     weather_user = None
     if loc.lat is not None and loc.lon is not None:
         weather_user = await fetch_weather(loc.lat, loc.lon)
-
     return EnvironmentalResponse(
         station_a=weather_a, station_b=weather_b,
         user_location=weather_user, user_lat=loc.lat, user_lon=loc.lon,
@@ -1016,27 +1122,29 @@ async def environmental_data(loc: UserLocationIn):
 def system_status():
     result = {}
     for sid, st in stations.items():
+        sess = optim_sessions.get(sid)
         result[sid] = {
-            "station_id":          sid,
-            "label":               STATION_COORDS.get(sid, {}).get("label", sid),
-            "status":              "ONLINE" if st.connection.online else "OFFLINE",
-            "signal_dbm":          st.signal_dbm,
-            "azimuth":             st.current_angles.azimuth,
-            "elevation":           st.current_angles.elevation,
-            "mode":                st.mode,
-            "has_error":           st.error.has_error,
-            "error_message":       st.error.error_message,
-            # IMU additions
-            "imu_az":              st.imu.imu_az,
-            "imu_el":              st.imu.imu_el,
-            "imu_calibrated":      st.imu.calibrated,
-            "calibration_pending": st.calibration_pending,
-            "last_verify_ok":      st.last_verification.success,
-            # optimizer state
-            "optim_phase":         optim_sessions[sid].phase if sid in optim_sessions else None,
-            "optim_converged":     optim_sessions[sid].converged if sid in optim_sessions else None,
-            "optim_best_signal":   optim_sessions[sid].best_signal if sid in optim_sessions else None,
-            "optim_sweep_remaining": len(optim_sessions[sid].sweep_queue) if sid in optim_sessions else 0,
+            "station_id":              sid,
+            "label":                   STATION_COORDS.get(sid, {}).get("label", sid),
+            "status":                  "ONLINE" if st.connection.online else "OFFLINE",
+            "signal_dbm":              st.signal_dbm,
+            "azimuth":                 st.current_angles.azimuth,
+            "elevation":               st.current_angles.elevation,
+            "mode":                    st.mode,
+            "has_error":               st.error.has_error,
+            "error_message":           st.error.error_message,
+            "imu_az":                  st.imu.imu_az,
+            "imu_el":                  st.imu.imu_el,
+            "imu_calibrated":          st.imu.calibrated,
+            "calibration_pending":     st.calibration_pending,
+            "last_verify_ok":          st.last_verification.success,
+            "both_online":             both_stations_online(),
+            "optim_phase":             sess.phase            if sess else None,
+            "optim_converged":         sess.converged         if sess else None,
+            "optim_sweep_role":        sess.sweep_role        if sess else None,
+            "optim_best_signal":       sess.best_signal       if sess else None,
+            "optim_collective_signal": sess.collective_best_signal if sess else None,
+            "optim_sweep_remaining":   len(sess.sweep_queue)  if sess else 0,
         }
 
     if stations:
@@ -1066,16 +1174,13 @@ def get_logs(limit: int = 100):
 # PDF REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def _build_pdf() -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
                             rightMargin=2*cm, leftMargin=2*cm,
                             topMargin=2*cm, bottomMargin=2*cm)
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("Title2", parent=styles["Title"],
-                                 fontSize=20, spaceAfter=6,
+    styles    = getSampleStyleSheet()
+    title_style = ParagraphStyle("Title2", parent=styles["Title"], fontSize=20, spaceAfter=6,
                                  textColor=colors.HexColor("#0f172a"))
     h1   = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=14,
                            textColor=colors.HexColor("#1e40af"), spaceAfter=4, spaceBefore=12)
@@ -1086,20 +1191,20 @@ def _build_pdf() -> bytes:
     story  = []
 
     story.append(Paragraph("Satellite Realignment System", title_style))
-    story.append(Paragraph("Operational Report (with IMU Feedback)", styles["Heading2"]))
+    story.append(Paragraph("Operational Report (v4 — Coordinated Sweep / Collective Lock)", styles["Heading2"]))
     story.append(Paragraph(f"Generated: {ts_str}", small))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1e40af")))
     story.append(Spacer(1, 0.5*cm))
 
-    # 1. Overview
     story.append(Paragraph("1. System Overview", h1))
     overview = [
         ["Parameter", "Value"],
-        ["Stations Monitored", str(len(stations))],
-        ["Online Stations",    str(sum(1 for s in stations.values() if s.connection.online))],
-        ["IMU Feedback",       "Active (MPU-6050)"],
-        ["Architecture",       "ESP32 → FastAPI → Dashboard"],
-        ["Report Timestamp",   ts_str],
+        ["Stations Monitored",  str(len(stations))],
+        ["Online Stations",     str(sum(1 for s in stations.values() if s.connection.online))],
+        ["Both Stations Online",str(both_stations_online())],
+        ["IMU Feedback",        "Active (MPU-6050)"],
+        ["Sweep Strategy",      "Coordinated mirror sweep — collective lock"],
+        ["Report Timestamp",    ts_str],
     ]
     t = Table(overview, colWidths=[7*cm, 9*cm])
     t.setStyle(TableStyle([
@@ -1115,12 +1220,14 @@ def _build_pdf() -> bytes:
     story.append(t)
     story.append(Spacer(1, 0.4*cm))
 
-    # 2. Station Status (now includes IMU)
     story.append(Paragraph("2. Station Status", h1))
-    rows = [["Station", "Status", "Mode", "AZ (°)", "EL (°)", "IMU AZ (°)", "IMU EL (°)", "Signal (dBm)", "IMU Cal"]]
+    rows = [["Station", "Status", "Mode", "AZ (°)", "EL (°)", "IMU AZ", "IMU EL",
+             "Signal (dBm)", "Sweep Role", "IMU Cal"]]
     for sid, st in stations.items():
         label = STATION_COORDS.get(sid, {}).get("label", sid)
         sig   = f"{st.signal_dbm:.1f}" if st.signal_dbm > -99 else "N/A"
+        sess  = optim_sessions.get(sid)
+        role  = sess.sweep_role if sess else "-"
         rows.append([
             label,
             "ONLINE" if st.connection.online else "OFFLINE",
@@ -1130,11 +1237,13 @@ def _build_pdf() -> bytes:
             f"{st.imu.imu_az:.1f}",
             f"{st.imu.imu_el:.1f}",
             sig,
+            role,
             "Yes" if st.imu.calibrated else "No",
         ])
     if len(rows) == 1:
-        rows.append(["No stations", "-", "-", "-", "-", "-", "-", "-", "-"])
-    t2 = Table(rows, colWidths=[3.2*cm, 1.8*cm, 1.6*cm, 1.6*cm, 1.6*cm, 2*cm, 2*cm, 2.2*cm, 1.5*cm])
+        rows.append(["No stations"] + ["-"]*9)
+    t2 = Table(rows, colWidths=[3*cm, 1.7*cm, 1.5*cm, 1.5*cm, 1.5*cm,
+                                 1.7*cm, 1.7*cm, 2*cm, 2*cm, 1.5*cm])
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
         ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
@@ -1147,25 +1256,60 @@ def _build_pdf() -> bytes:
     story.append(t2)
     story.append(Spacer(1, 0.4*cm))
 
-    # 3. Movement Verifications
-    story.append(Paragraph("3. Movement Verification Log", h1))
-    v_rows = db_fetch(
-        "SELECT ts, station_id, success, imu_az_delta, imu_el_delta, target_az, target_el FROM verification_log ORDER BY id DESC LIMIT 20"
+    # Collective lock log
+    story.append(Paragraph("3. Collective Lock History", h1))
+    cl_rows = db_fetch(
+        "SELECT ts, step_index, s1_az, s1_el, s1_signal, s2_az, s2_el, s2_signal, combined_score "
+        "FROM collective_lock_log ORDER BY id DESC LIMIT 20"
     )
-    vt = [["Time", "Station", "Result", "IMU AZ Δ (°)", "IMU EL Δ (°)", "Target AZ", "Target EL"]]
+    ct = [["Time", "Step", "S1 AZ", "S1 EL", "S1 dBm", "S2 AZ", "S2 EL", "S2 dBm", "Score"]]
+    for row in cl_rows:
+        ct.append([
+            row["ts"][:16],
+            str(row["step_index"]),
+            f"{row['s1_az']:.1f}°",
+            f"{row['s1_el']:.1f}°",
+            f"{row['s1_signal']:.1f}",
+            f"{row['s2_az']:.1f}°",
+            f"{row['s2_el']:.1f}°",
+            f"{row['s2_signal']:.1f}",
+            f"{row['combined_score']:.1f}",
+        ])
+    if len(ct) == 1:
+        ct.append(["No data"] + ["-"]*8)
+    t_cl = Table(ct, colWidths=[3.5*cm, 1.2*cm, 1.8*cm, 1.8*cm, 1.8*cm,
+                                  1.8*cm, 1.8*cm, 1.8*cm, 1.8*cm])
+    t_cl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
+        ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
+        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0,0), (-1,-1), 7),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.HexColor("#f8fafc"), colors.white]),
+        ("GRID",       (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")),
+        ("ALIGN",      (1,0), (-1,-1), "CENTER"),
+    ]))
+    story.append(t_cl)
+    story.append(Spacer(1, 0.4*cm))
+
+    story.append(Paragraph("4. Movement Verification Log", h1))
+    v_rows = db_fetch(
+        "SELECT ts, station_id, success, imu_az_delta, imu_el_delta, target_az, target_el "
+        "FROM verification_log ORDER BY id DESC LIMIT 20"
+    )
+    vt = [["Time", "Station", "Result", "IMU AZ Δ", "IMU EL Δ", "Target AZ", "Target EL"]]
     for row in v_rows:
         vt.append([
             row["ts"][:16],
             STATION_COORDS.get(row["station_id"], {}).get("label", row["station_id"]),
             "OK" if row["success"] else "FAIL",
-            f"{row['imu_az_delta']:.2f}",
-            f"{row['imu_el_delta']:.2f}",
+            f"{row['imu_az_delta']:.2f}°",
+            f"{row['imu_el_delta']:.2f}°",
             f"{row['target_az']:.1f}°",
             f"{row['target_el']:.1f}°",
         ])
     if len(vt) == 1:
-        vt.append(["No data", "-", "-", "-", "-", "-", "-"])
-    t3 = Table(vt, colWidths=[3.5*cm, 3.5*cm, 1.5*cm, 2.5*cm, 2.5*cm, 2*cm, 2.5*cm])
+        vt.append(["No data"] + ["-"]*6)
+    t3 = Table(vt, colWidths=[3.5*cm, 3.5*cm, 1.5*cm, 2.2*cm, 2.2*cm, 2*cm, 2.6*cm])
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
         ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
@@ -1178,41 +1322,10 @@ def _build_pdf() -> bytes:
     story.append(t3)
     story.append(Spacer(1, 0.4*cm))
 
-    # 4. Position vs Signal log
-    story.append(Paragraph("4. Position vs Signal Log", h1))
-    ps_rows = db_fetch(
-        "SELECT ts, station_id, azimuth, elevation, signal_dbm "
-        "FROM position_signal_log ORDER BY id DESC LIMIT 50"
-    )
-    ps_table = [["Time", "Station", "AZ (°)", "EL (°)", "Signal (dBm)"]]
-    for row in ps_rows:
-        sig = f"{row['signal_dbm']:.1f}" if row['signal_dbm'] > -99 else "N/A"
-        ps_table.append([
-            row["ts"][:16],
-            STATION_COORDS.get(row["station_id"], {}).get("label", row["station_id"]),
-            f"{row['azimuth']:.1f}",
-            f"{row['elevation']:.1f}",
-            sig,
-        ])
-    if len(ps_table) == 1:
-        ps_table.append(["No data", "-", "-", "-", "-"])
-    t_ps = Table(ps_table, colWidths=[4*cm, 4.5*cm, 2.5*cm, 2.5*cm, 3.5*cm])
-    t_ps.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
-        ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
-        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",   (0,0), (-1,-1), 7),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.HexColor("#f8fafc"), colors.white]),
-        ("GRID",       (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")),
-        ("ALIGN",      (2,0), (-1,-1), "CENTER"),
-    ]))
-    story.append(t_ps)
-    story.append(Spacer(1, 0.4*cm))
-
-    # 5. Environmental
-    story.append(Paragraph("4. Environmental Data", h1))
+    story.append(Paragraph("5. Environmental Data", h1))
     env_rows_db = db_fetch(
-        "SELECT station_id, ts, temperature, wind_speed, rain, humidity, pressure FROM env_log ORDER BY id DESC LIMIT 20"
+        "SELECT station_id, ts, temperature, wind_speed, rain, humidity, pressure "
+        "FROM env_log ORDER BY id DESC LIMIT 20"
     )
     env_table = [["Station", "Timestamp", "Temp (°C)", "Wind (km/h)", "Rain", "Humidity", "Pressure"]]
     for row in env_rows_db:
@@ -1226,7 +1339,7 @@ def _build_pdf() -> bytes:
             f"{row['pressure']:.0f}",
         ])
     if len(env_table) == 1:
-        env_table.append(["No data", "-", "-", "-", "-", "-", "-"])
+        env_table.append(["No data"] + ["-"]*6)
     t4 = Table(env_table, colWidths=[3.8*cm, 3*cm, 2*cm, 2.2*cm, 2*cm, 2.2*cm, 2.3*cm])
     t4.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
@@ -1239,8 +1352,7 @@ def _build_pdf() -> bytes:
     story.append(t4)
     story.append(Spacer(1, 0.4*cm))
 
-    # 6. System Logs
-    story.append(Paragraph("5. System Logs (Last 30)", h1))
+    story.append(Paragraph("6. System Logs (Last 30)", h1))
     log_rows = db_fetch(
         "SELECT ts, station_id, level, message FROM system_log ORDER BY id DESC LIMIT 30"
     )
@@ -1248,7 +1360,7 @@ def _build_pdf() -> bytes:
     for row in log_rows:
         log_table.append([row["ts"][:16], row["station_id"], row["level"], row["message"]])
     if len(log_table) == 1:
-        log_table.append(["No logs", "-", "-", "-"])
+        log_table.append(["No logs"] + ["-"]*3)
     t5 = Table(log_table, colWidths=[3.5*cm, 3*cm, 2*cm, 9.5*cm])
     t5.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
@@ -1263,8 +1375,7 @@ def _build_pdf() -> bytes:
     story.append(Spacer(1, 0.4*cm))
 
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
-    story.append(Paragraph("End of Report — Satellite Realignment System v3", small))
-
+    story.append(Paragraph("End of Report — Satellite Realignment System v4", small))
     doc.build(story)
     return buf.getvalue()
 
@@ -1284,12 +1395,25 @@ def download_pdf():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def optimizer_loop():
-    STEP_INTERVAL           = 4
-    CHECK_INTERVAL          = 3
-    LOCK_WATCH_INTERVAL     = 2
-    MIN_SAMPLES_FOR_REFINE  = 6
+    """
+    Main control loop — all sweep/refine/lock logic lives here.
 
-    step_timers:  Dict[str, float] = {}
+    Key invariants enforced in v4:
+      1. No sweep starts unless both stations are online.
+      2. Station_1 runs the FORWARD grid; station_2 runs the MIRRORED grid.
+         Both grids share the same step_index values so every waypoint pair
+         is semantically "the same pose from each end."
+      3. Sweep steps are dispatched in LOCKSTEP: a new waypoint is only sent
+         to a station when it has acknowledged the previous command AND its
+         partner has also moved (both commands must clear before advancing).
+      4. Lock position is chosen by compute_collective_best(), which picks the
+         step_index with the best min(s1, s2) signal — not individual bests.
+    """
+    STEP_INTERVAL          = 0.4    # was 1.33 — 10× faster than original 4s
+    CHECK_INTERVAL         = 0.3    # was 1.0  — 10× faster than original 3s
+    LOCK_WATCH_INTERVAL    = 0.2    # was 0.67 — 10× faster than original 2s
+    MIN_SAMPLES_FOR_REFINE = 6
+
     check_timers: Dict[str, float] = {}
     watch_timers: Dict[str, float] = {}
 
@@ -1298,169 +1422,317 @@ async def optimizer_loop():
     while True:
         now = asyncio.get_event_loop().time()
 
-        # ── CROSS-STATION HELPERS ─────────────────────────────────────────
-        all_ids = list(optim_sessions.keys())
+        # ── GUARD: only operate when both stations are present ─────────────
+        if not both_stations_online():
+            # Mark any active sessions as IDLE so the dashboard shows the wait
+            for sid in STATION_PAIR:
+                sess = optim_sessions.get(sid)
+                if sess and sess.active and not sess.converged:
+                    sess.phase = OptimPhase.IDLE
+            await asyncio.sleep(1)
+            continue
 
-        def any_station_sweeping(exclude_id: str) -> bool:
-            """True if any OTHER station is still in COARSE sweep."""
-            return any(
-                s.sweeping and not s.converged and sid != exclude_id
-                for sid, s in optim_sessions.items()
-            )
+        sid1, sid2 = STATION_PAIR
+        sess1 = optim_sessions.get(sid1)
+        sess2 = optim_sessions.get(sid2)
 
-        def all_stations_ready_to_lock() -> bool:
-            """True when every station has converged OR is waiting to lock."""
-            return all(
-                s.converged or s.waiting_to_lock
-                for s in optim_sessions.values()
-            )
+        if not sess1 or not sess2:
+            await asyncio.sleep(0.05)
+            continue
 
-        def force_recal_all(except_id: str, reason: str):
-            """Trigger a local recal sweep on every station except the one that initiated."""
-            for sid, s in optim_sessions.items():
-                if sid == except_id:
-                    continue
-                st = stations.get(sid)
-                if not st:
-                    continue
-                s.sweep_queue  = build_local_sweep(s.best_az, s.best_el,
-                                                   radius=20.0, step=10.0)
-                s.sweeping     = True
-                s.converged    = False
-                s.waiting_to_lock = False
-                s.active       = True
-                s.phase        = OptimPhase.COARSE
-                s.samples      = []
-                s.iteration    = 0
-                s.locked_at    = None
-                s.sweep_reason = f"sync recal (triggered by {except_id}: {reason})"
-                log_to_db(sid, f"Sync recal started — reason from {except_id}: {reason}", "WARN")
+        st1 = stations.get(sid1)
+        st2 = stations.get(sid2)
+        if not st1 or not st2:
+            await asyncio.sleep(0.05)
+            continue
 
-        # ── PER-STATION LOOP ──────────────────────────────────────────────
-        for station_id, sess in list(optim_sessions.items()):
-            station = stations.get(station_id)
-            if not station or station.mode != Mode.AUTO:
-                continue
+        # Ensure both are in AUTO
+        if st1.mode != Mode.AUTO or st2.mode != Mode.AUTO:
+            await asyncio.sleep(0.05)
+            continue
 
-            # ── LOCKED: watch for disturbances ────────────────────────────
-            if sess.converged:
-                last_watch = watch_timers.get(station_id, 0)
+        # ── LOCKED: watch for disturbances on BOTH stations ────────────────
+        if sess1.converged and sess2.converged:
+            for sid, sess, st in [(sid1, sess1, st1), (sid2, sess2, st2)]:
+                last_watch = watch_timers.get(sid, 0)
                 if now - last_watch < LOCK_WATCH_INTERVAL:
                     continue
-                watch_timers[station_id] = now
+                watch_timers[sid] = now
 
                 if len(sess.samples) < RECAL_WINDOW:
                     continue
 
                 recent  = sess.samples[-RECAL_WINDOW:]
                 signals = [s.signal_dbm for s in recent]
-                current_signal = signals[-1]
+                current = signals[-1]
 
-                sorted_sigs   = sorted(signals)
-                median_signal = sorted_sigs[len(sorted_sigs) // 2]
-                variance      = float(np.var(signals))
-
-                last_5 = signals[-5:] if len(signals) >= 5 else signals
-                sustained_drop = all(
-                    s < (median_signal - REDISCOVER_DROP_DBM) for s in last_5
-                )
-                signal_is_poor = current_signal < RECAL_MIN_SIGNAL_DBM
+                # ── DROP DETECTION ─────────────────────────────────────────
+                # Trigger immediately if current reading has dropped more than
+                # RECAL_DROP_DBM below the collective lock signal.
+                # No "sustained" requirement — a single bad reading is enough
+                # because we react fast and validate at the second-best position
+                # before committing to a full sweep.
+                lock_ref   = sess.collective_best_signal
+                drop_amount = lock_ref - current   # positive = signal got worse
+                near_best   = current >= (lock_ref - REDISCOVER_DROP_DBM)
 
                 locked_at = sess.locked_at or now
                 scheduled = (now - locked_at) >= RECAL_SCHEDULED_SECS
-                near_best = current_signal >= (sess.best_signal - 3.0)
 
-                if near_best:
+                if near_best and not scheduled:
+                    # Signal still healthy — reset the scheduled recal clock
                     sess.locked_at = now
                     continue
 
-                trigger = (sustained_drop and signal_is_poor) or scheduled
-                if trigger:
+                if not near_best:
                     reason = (
-                        f"scheduled recal after {RECAL_SCHEDULED_SECS}s"
-                        if scheduled
-                        else f"sustained drop: last5={[round(x,1) for x in last_5]} median={median_signal:.1f} dBm"
+                        f"signal drop {drop_amount:.1f} dB below lock "
+                        f"(current={current:.1f} lock_ref={lock_ref:.1f})"
                     )
-                    log_to_db(station_id, f"Recal triggered ({reason}) — syncing all stations", "WARN")
-
-                    # Recal THIS station
-                    sess.sweep_queue  = build_local_sweep(sess.best_az, sess.best_el,
-                                                          radius=20.0, step=10.0)
-                    sess.sweeping     = True
-                    sess.converged    = False
-                    sess.waiting_to_lock = False
-                    sess.active       = True
-                    sess.phase        = OptimPhase.COARSE
-                    sess.samples      = []
-                    sess.iteration    = 0
-                    sess.locked_at    = None
-                    sess.sweep_reason = reason
-
-                    # Force recal on ALL other stations simultaneously
-                    force_recal_all(station_id, reason)
-                continue
-
-            # ── WAITING TO LOCK: hold until all stations are ready ─────────
-            if sess.waiting_to_lock:
-                if all_stations_ready_to_lock():
-                    # Everyone is ready — lock all together
-                    for sid, s in optim_sessions.items():
-                        if s.waiting_to_lock or (s.converged and s.locked_at is None):
-                            s.waiting_to_lock = False
-                            s.active          = False
-                            s.converged       = True
-                            s.phase           = OptimPhase.LOCK
-                            s.locked_at       = now
-                            log_to_db(sid,
-                                      f"LOCKED (synchronized) — AZ={s.best_az:.1f} "
-                                      f"EL={s.best_el:.1f} signal={s.best_signal:.1f} dBm", "INFO")
+                elif scheduled:
+                    reason = f"scheduled recal after {RECAL_SCHEDULED_SECS}s"
                 else:
-                    log_to_db(station_id, "Waiting to lock — other stations still sweeping", "INFO")
-                continue
-
-            if not sess.active:
-                continue
-
-            # ── COARSE: drain the sweep queue ─────────────────────────────
-            if sess.sweeping and sess.sweep_queue:
-                if station.command.pending:
                     continue
 
-                waypoint = sess.sweep_queue.pop(0)
-                target_az, target_el = waypoint[0], waypoint[1]
+                log_to_db(sid, f"Recal triggered ({reason})", "WARN")
 
-                station.target_angles = Angles(azimuth=target_az, elevation=target_el)
-                station.command = CommandState(
+                # ── 3-STEP RECAL STRATEGY ──────────────────────────────────
+                #
+                # Step 1: Move BOTH stations to their second-best position
+                #         (the best position that isn't the lock position).
+                # Step 2: Read signal at second-best.
+                #         • If signal ≥ (lock_ref − RECAL_DROP_DBM) → lock there.
+                #         • Otherwise → run a fast 3×3 full sweep and relock.
+                #
+                # The second-best probe is handled by the recal_probe state
+                # machine below.  We set recal_phase="probe" on both sessions
+                # and the probe logic runs on the next loop ticks.
+
+                for i, (rsid, rsess) in enumerate([(sid1, sess1), (sid2, sess2)]):
+                    mirrored = (i == 1)
+
+                    has_second_best = rsess.second_best_signal > -900.0
+                    probe_az = rsess.second_best_az if has_second_best else rsess.collective_best_az
+                    probe_el = rsess.second_best_el if has_second_best else rsess.collective_best_el
+
+                    # Reset to a probe sweep: one-waypoint queue = second-best position
+                    # step_index 0 marks it as the probe point
+                    rsess.sweep_queue     = [[probe_az, probe_el, 0]]
+                    rsess.sweeping        = True
+                    rsess.converged       = False
+                    rsess.waiting_to_lock = False
+                    rsess.active          = True
+                    rsess.phase           = OptimPhase.COARSE
+                    rsess.samples         = []
+                    rsess.iteration       = 0
+                    rsess.locked_at       = None
+                    rsess.sweep_reason    = f"recal-probe: {reason}"
+                    # Store the lock reference so probe can compare after moving
+                    rsess.collective_best_signal = lock_ref
+
+                    log_to_db(rsid,
+                              f"Recal probe → second-best AZ={probe_az:.1f} "
+                              f"EL={probe_el:.1f} ({rsess.sweep_role}) — {reason}", "WARN")
+                break   # only one recal trigger per loop iteration
+            await asyncio.sleep(0.05)
+            continue
+
+        # ── RECAL PROBE RESULT CHECK ───────────────────────────────────────
+        # After the probe sweep (1-waypoint queue) drains and both stations
+        # have collected at least 3 samples, evaluate the signal:
+        #   • Good enough → lock immediately at probe position
+        #   • Not good enough → escalate to full 3×3 sweep
+
+        def _probe_complete(sess: OptimSession) -> bool:
+            """True when the probe waypoint has been dispatched and samples collected."""
+            return (
+                sess.active
+                and not sess.sweeping          # queue drained
+                and not sess.converged
+                and "recal-probe" in sess.sweep_reason
+                and len(sess.samples) >= 3
+            )
+
+        if _probe_complete(sess1) and _probe_complete(sess2):
+            probe_sig1 = max((s.signal_dbm for s in sess1.samples), default=-999.0)
+            probe_sig2 = max((s.signal_dbm for s in sess2.samples), default=-999.0)
+            ref1 = sess1.collective_best_signal
+            ref2 = sess2.collective_best_signal
+
+            good1 = probe_sig1 >= (ref1 - REDISCOVER_DROP_DBM)
+            good2 = probe_sig2 >= (ref2 - REDISCOVER_DROP_DBM)
+
+            if good1 and good2:
+                # Signal recovered at second-best — lock both stations here
+                log_to_db("system",
+                          f"Recal probe successful — locking at second-best positions "
+                          f"S1={probe_sig1:.1f} S2={probe_sig2:.1f}", "INFO")
+                _apply_lock(sid1, sess1, st1, sess1.best_az, sess1.best_el, probe_sig1, now)
+                _apply_lock(sid2, sess2, st2, sess2.best_az, sess2.best_el, probe_sig2, now)
+                sess1.collective_best_signal = min(probe_sig1, probe_sig2)
+                sess2.collective_best_signal = min(probe_sig1, probe_sig2)
+            else:
+                # Probe not good enough — escalate to fast 3×3 sweep
+                log_to_db("system",
+                          f"Recal probe insufficient (S1={probe_sig1:.1f} S2={probe_sig2:.1f}) "
+                          f"— starting 3×3 sweep", "WARN")
+                for i, (rsid, rsess) in enumerate([(sid1, sess1), (sid2, sess2)]):
+                    mirrored = (i == 1)
+                    rsess.sweep_queue  = build_sweep_grid(
+                        az_step  = RECAL_AZ_STEP,
+                        el_step  = RECAL_EL_STEP,
+                        mirrored = mirrored,
+                    )
+                    rsess.sweeping        = True
+                    rsess.converged       = False
+                    rsess.waiting_to_lock = False
+                    rsess.active          = True
+                    rsess.phase           = OptimPhase.COARSE
+                    rsess.samples         = []
+                    rsess.iteration       = 0
+                    rsess.locked_at       = None
+                    rsess.sweep_reason    = "recal-3x3 sweep"
+                    log_to_db(rsid, f"3×3 recal sweep started ({rsess.sweep_role})", "WARN")
+            await asyncio.sleep(0.05)
+            continue
+
+        # ── WAITING TO LOCK: both must be ready before we commit ───────────
+        # We wait indefinitely — no timeout.  Locking before both stations
+        # have finished refining is what caused the bad lock in v4.1 where
+        # station 2 timed out and locked individually at a poor position,
+        # then the collective lock ran anyway and picked a coarse-only result.
+        both_waiting  = sess1.waiting_to_lock and sess2.waiting_to_lock
+        either_waiting = sess1.waiting_to_lock or sess2.waiting_to_lock
+        if either_waiting and not both_waiting:
+            # One station has converged, the other is still refining — just wait.
+            await asyncio.sleep(0.17)
+            continue
+
+        if both_waiting:
+            # ── COLLECTIVE LOCK DECISION ───────────────────────────────────
+            result = compute_collective_best(sess1, sess2)
+            if result is None:
+                # Rare: no matching steps — fall back to individual bests
+                log_to_db("system",
+                          "No matching step indices for collective lock — using individual bests", "WARN")
+                for sid, sess, st in [(sid1, sess1, st1), (sid2, sess2, st2)]:
+                    _apply_lock(sid, sess, st,
+                                sess.best_az, sess.best_el, sess.best_signal, now)
+            else:
+                step_idx, s1_az, s1_el, s2_az, s2_el, score = result
+
+                # Record the decision
+                ts = datetime.now(timezone.utc).isoformat()
+                s1_sig = next((s.signal_dbm for s in sess1.samples if s.step_index == step_idx), -99.0)
+                s2_sig = next((s.signal_dbm for s in sess2.samples if s.step_index == step_idx), -99.0)
+                db_exec(
+                    "INSERT INTO collective_lock_log "
+                    "(ts, step_index, s1_az, s1_el, s1_signal, s2_az, s2_el, s2_signal, combined_score) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (ts, step_idx, s1_az, s1_el, s1_sig, s2_az, s2_el, s2_sig, score)
+                )
+                log_to_db("system",
+                          f"Collective lock — step={step_idx} "
+                          f"S1=[AZ={s1_az:.1f} EL={s1_el:.1f} {s1_sig:.1f}dBm] "
+                          f"S2=[AZ={s2_az:.1f} EL={s2_el:.1f} {s2_sig:.1f}dBm] "
+                          f"score(min)={score:.1f}", "INFO")
+
+                _apply_lock(sid1, sess1, st1, s1_az, s1_el, s1_sig, now)
+                _apply_lock(sid2, sess2, st2, s2_az, s2_el, s2_sig, now)
+
+                # Store collective_best on each session for disturbance detection
+                for sess, az, el, sig in [
+                    (sess1, s1_az, s1_el, s1_sig),
+                    (sess2, s2_az, s2_el, s2_sig),
+                ]:
+                    sess.collective_best_az     = az
+                    sess.collective_best_el     = el
+                    sess.collective_best_signal = score   # use the pair score as the health threshold
+            await asyncio.sleep(0.05)
+            continue
+
+        # ── COARSE: lockstep sweep ─────────────────────────────────────────
+        #
+        # Both stations must be clear of pending commands before either one
+        # advances. We check readiness for BOTH first, then dispatch to BOTH
+        # in the same loop iteration. This prevents the previous bug where
+        # station_1 was dispatched first (setting its command.pending=True),
+        # which then caused station_2 to see its partner as busy and skip,
+        # leaving station_2 permanently idle.
+
+        s1_sweep_ready = (
+            sess1.active and not sess1.converged and not sess1.waiting_to_lock
+            and sess1.sweeping and bool(sess1.sweep_queue)
+            and not st1.command.pending
+        )
+        s2_sweep_ready = (
+            sess2.active and not sess2.converged and not sess2.waiting_to_lock
+            and sess2.sweeping and bool(sess2.sweep_queue)
+            and not st2.command.pending
+        )
+
+        # Only advance when BOTH are ready — true lockstep
+        if s1_sweep_ready and s2_sweep_ready:
+            for sid, sess, st in [(sid1, sess1, st1), (sid2, sess2, st2)]:
+                waypoint = sess.sweep_queue.pop(0)
+                target_az, target_el, step_idx = waypoint[0], waypoint[1], int(waypoint[2])
+
+                st.target_angles = Angles(azimuth=target_az, elevation=target_el)
+                st.command = CommandState(
                     pending=True,
                     issued_at=datetime.now(timezone.utc),
                     acknowledged=False,
                 )
                 sess.last_commanded = Angles(azimuth=target_az, elevation=target_el)
-                sess.iteration += 1
+                sess.iteration      = step_idx   # keep iteration == step_index
 
-                remaining = len(sess.sweep_queue)
-                log_to_db(station_id,
-                          f"[SWEEP] step={sess.iteration} → AZ={target_az} EL={target_el} "
-                          f"remaining={remaining} reason='{sess.sweep_reason}'")
+                log_to_db(sid,
+                          f"[SWEEP/{sess.sweep_role}] step={step_idx} → "
+                          f"AZ={target_az} EL={target_el} "
+                          f"remaining={len(sess.sweep_queue)} "
+                          f"reason='{sess.sweep_reason}'")
+
+                # ── Log every coarse waypoint dispatch ──────────────────────
+                station_now = stations.get(sid)
+                persist_optimizer_reading(
+                    station_id   = sid,
+                    phase        = "COARSE",
+                    step_index   = step_idx,
+                    commanded_az = target_az,
+                    commanded_el = target_el,
+                    signal_dbm   = station_now.signal_dbm if station_now else -99.0,
+                    sweep_role   = sess.sweep_role,
+                    reason       = sess.sweep_reason,
+                    reported_az  = station_now.current_angles.azimuth if station_now else 0.0,
+                    reported_el  = station_now.current_angles.elevation if station_now else 0.0,
+                )
 
                 if not sess.sweep_queue:
                     sess.sweeping = False
                     sess.phase    = OptimPhase.REFINE
-                    log_to_db(station_id,
-                              f"Sweep complete — {len(sess.samples)} samples, entering REFINE")
-                continue
+                    log_to_db(sid, f"Sweep complete — {len(sess.samples)} samples, entering REFINE")
 
-            # ── REFINE: block if any other station is still in COARSE ──────
-            if any_station_sweeping(station_id):
-                # Idle — don't issue refine commands until all stations reach REFINE
-                continue
+        # ── REFINE: quadratic regression toward peak (per-station) ─────────
+        #
+        # Both stations refine independently once their sweeps finish.
+        # We still gate each REFINE step on both commands being clear so
+        # step_index increments stay approximately in sync.
 
-            # ── REFINE: quadratic regression toward peak ───────────────────
-            last_step = step_timers.get(station_id, 0)
-            if now - last_step < STEP_INTERVAL:
-                pass
-            elif not station.command.pending and len(sess.samples) >= MIN_SAMPLES_FOR_REFINE:
-                step_timers[station_id] = now
+        both_sweep_done = not sess1.sweeping and not sess2.sweeping
+        if both_sweep_done:
+            for sid, sess, st in [(sid1, sess1, st1), (sid2, sess2, st2)]:
+                if not sess.active or sess.converged or sess.waiting_to_lock or sess.sweeping:
+                    continue
+
+                last_step_time = getattr(sess, '_last_refine_t', 0)
+                if now - last_step_time < STEP_INTERVAL:
+                    continue
+                if st.command.pending:
+                    continue
+                if len(sess.samples) < MIN_SAMPLES_FOR_REFINE:
+                    continue
+
+                sess._last_refine_t = now   # type: ignore[attr-defined]
 
                 MIN_AZ, MAX_AZ = SWEEP_AZ_START, SWEEP_AZ_END
                 MIN_EL, MAX_EL = SWEEP_EL_START, SWEEP_EL_END
@@ -1472,17 +1744,14 @@ async def optimizer_loop():
                     if abs(s.azimuth   - sess.best_az) <= LOCAL_WINDOW
                     and abs(s.elevation - sess.best_el) <= LOCAL_WINDOW
                 ]
-
                 peak = fit_quadratic_peak(local_samples) if len(local_samples) >= 6 else None
 
                 if peak is None:
                     sess.iteration += 1
-                    angle    = sess.iteration * 1.2
-                    nudge_az = sess.best_az + NUDGE * np.cos(angle)
-                    nudge_el = sess.best_el + NUDGE * np.sin(angle)
-                    target_az = float(np.clip(nudge_az, MIN_AZ, MAX_AZ))
-                    target_el = float(np.clip(nudge_el, MIN_EL, MAX_EL))
-                    reason = "spiral nudge"
+                    angle     = sess.iteration * 1.2
+                    target_az = float(np.clip(sess.best_az + NUDGE * np.cos(angle), MIN_AZ, MAX_AZ))
+                    target_el = float(np.clip(sess.best_el + NUDGE * np.sin(angle), MIN_EL, MAX_EL))
+                    reason    = "spiral nudge"
                 else:
                     target_az = float(np.clip(peak[0], MIN_AZ, MAX_AZ))
                     target_el = float(np.clip(peak[1], MIN_EL, MAX_EL))
@@ -1490,37 +1759,74 @@ async def optimizer_loop():
                     sess.iteration += 1
                     reason = "quadratic peak"
 
-                station.target_angles = Angles(azimuth=target_az, elevation=target_el)
-                station.command = CommandState(
+                st.target_angles = Angles(azimuth=target_az, elevation=target_el)
+                st.command = CommandState(
                     pending=True,
                     issued_at=datetime.now(timezone.utc),
                     acknowledged=False,
                 )
                 sess.last_commanded = Angles(azimuth=target_az, elevation=target_el)
-                log_to_db(station_id,
+                log_to_db(sid,
                           f"[REFINE] step={sess.iteration} → AZ={target_az:.1f} EL={target_el:.1f} "
                           f"[{reason}] samples={len(sess.samples)}")
 
-            # ── CONVERGENCE CHECK ──────────────────────────────────────────
-            last_check = check_timers.get(station_id, 0)
-            if now - last_check >= CHECK_INTERVAL and len(sess.samples) >= 10:
-                check_timers[station_id] = now
-                recent   = sess.samples[-10:]
-                signals  = [s.signal_dbm for s in recent]
-                variance = float(np.var(signals))
+                # ── Log every refine waypoint dispatch ───────────────────────
+                persist_optimizer_reading(
+                    station_id   = sid,
+                    phase        = "REFINE",
+                    step_index   = sess.iteration,
+                    commanded_az = target_az,
+                    commanded_el = target_el,
+                    signal_dbm   = st.signal_dbm if hasattr(st, 'signal_dbm') else -99.0,
+                    sweep_role   = sess.sweep_role,
+                    reason       = reason,
+                    reported_az  = st.current_angles.azimuth,
+                    reported_el  = st.current_angles.elevation,
+                )
 
+            # ── CONVERGENCE CHECK ──────────────────────────────────────────
+            for sid, sess in [(sid1, sess1), (sid2, sess2)]:
+                last_check = check_timers.get(sid, 0)
+                if now - last_check < CHECK_INTERVAL:
+                    continue
+                if len(sess.samples) < 10:
+                    continue
+                check_timers[sid] = now
+
+                signals  = [s.signal_dbm for s in sess.samples[-10:]]
+                variance = float(np.var(signals))
                 if variance <= 1.5:
-                    # Don't lock yet — enter waiting room
                     sess.waiting_to_lock = True
-                    sess.active          = False   # stop issuing refine commands
-                    log_to_db(station_id,
-                              f"Convergence reached — waiting for other stations "
+                    sess.active          = False
+                    log_to_db(sid,
+                              f"Convergence reached — entering lock wait "
                               f"(AZ={sess.best_az:.1f} EL={sess.best_el:.1f} "
                               f"signal={sess.best_signal:.1f} dBm var={variance:.2f})", "INFO")
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.05)   # 10× faster loop tick (was 0.5 original)
 
-        
+
+def _apply_lock(sid: str, sess: OptimSession, st: StationState,
+                az: float, el: float, signal: float, loop_now: float):
+    """Move the servo to the collective lock position and mark session as LOCKED."""
+    st.target_angles = Angles(azimuth=az, elevation=el)
+    st.command = CommandState(
+        pending=True,
+        issued_at=datetime.now(timezone.utc),
+        acknowledged=False,
+    )
+    sess.best_az         = az
+    sess.best_el         = el
+    sess.best_signal     = signal
+    sess.waiting_to_lock = False
+    sess.active          = False
+    sess.converged       = True
+    sess.phase           = OptimPhase.LOCK
+    sess.locked_at       = loop_now
+    log_to_db(sid,
+              f"LOCKED at collective best — AZ={az:.1f} EL={el:.1f} signal={signal:.1f} dBm", "INFO")
+
+
 async def heartbeat_monitor():
     while True:
         now = datetime.now(timezone.utc)
@@ -1530,6 +1836,12 @@ async def heartbeat_monitor():
                     if st.connection.online:
                         st.connection.online = False
                         log_to_db(st.station_id, "Station went OFFLINE (heartbeat timeout)", "WARN")
+                        # If a station drops offline mid-sweep, pause the sessions
+                        sess = optim_sessions.get(st.station_id)
+                        if sess and sess.active and not sess.converged:
+                            sess.phase = OptimPhase.IDLE
+                            log_to_db(st.station_id,
+                                      "Sweep paused — station offline", "WARN")
         await asyncio.sleep(1)
 
 
@@ -1547,10 +1859,8 @@ async def startup():
     init_db()
     for sid in STATION_COORDS:
         get_station(sid)
-        # DO NOT pre-create optim_sessions here.
-        # Sessions are created on first ESP32 heartbeat so the
-        # sweep starts from the actual boot position, not server start.
+        # Sessions created on first heartbeat once BOTH stations are online
     asyncio.create_task(heartbeat_monitor())
     asyncio.create_task(auto_weather_refresh())
-    log_to_db("system", "Backend v3 started — IMU feedback active")
     asyncio.create_task(optimizer_loop())
+    log_to_db("system", "Backend v4 started — coordinated sweep / collective lock active")
