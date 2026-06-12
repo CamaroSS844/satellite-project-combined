@@ -9,7 +9,7 @@ import {
 
 Chart.register(LineElement, PointElement, LineController, CategoryScale, LinearScale, Tooltip, Filler);
 
-const BASE_URL = 'http://192.168.100.14:8000';
+const BASE_URL = 'http://10.58.32.23:8000';
 const LIMIT = 40;
 const POLL_MS = 5000;
 

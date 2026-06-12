@@ -45,7 +45,7 @@ SWEEP_EL_END     = 150.0
 SWEEP_AZ_STEP    = 20.0
 SWEEP_EL_STEP    = 20.0
 
-REDISCOVER_DROP_DBM   = 7.0    # drop beyond this many dB below lock triggers recal
+REDISCOVER_DROP_DBM   = 10.0    # drop beyond this many dB below lock triggers recal
 RECAL_VARIANCE_THRESH = 8.0
 RECAL_WINDOW          = 10     # smaller window = faster reaction to drops
 RECAL_SCHEDULED_SECS  = 120
@@ -1452,7 +1452,8 @@ async def optimizer_loop():
             continue
 
         # ── LOCKED: watch for disturbances on BOTH stations ────────────────
-        if sess1.converged and sess2.converged:
+        if (sess1.converged or sess1.phase == OptimPhase.REFINE) and \
+   (sess2.converged or sess2.phase == OptimPhase.REFINE):
             for sid, sess, st in [(sid1, sess1, st1), (sid2, sess2, st2)]:
                 last_watch = watch_timers.get(sid, 0)
                 if now - last_watch < LOCK_WATCH_INTERVAL:

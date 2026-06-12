@@ -252,7 +252,7 @@ function drawGraph(
   ctx.clearRect(0, 0, W, H);
 
   // Fixed dBm range
-  const DBM_MIN = -20;
+  const DBM_MIN = -30;
   const DBM_MAX = 1;
   const DBM_RANGE = DBM_MAX - DBM_MIN;
 
