@@ -165,9 +165,11 @@ class OptimSession(BaseModel):
     converged:        bool              = False
     locked_at:        Optional[float]   = None
     sweep_queue:      List[List[float]] = []
+    sweep_total: int = 0
     sweeping:         bool              = False
     sweep_reason:     str               = ""
     waiting_to_lock:  bool              = False
+    lock_peak_variance: float           = 0.0
     # Which role this station plays in the current sweep pair
     # "forward"  → az ascending per row
     # "mirrored" → az descending per row (reversed within each row)
@@ -186,7 +188,8 @@ class StationState(BaseModel):
     imu:                 IMUState             = IMUState()
     last_verification:   MovementVerification = MovementVerification()
     calibration_pending: bool                 = False
-
+    onsite_override:     bool                 = False   # NEW: technician at the panel
+    override_started_at: Optional[datetime]   = None    # NEW
 
 class WeatherData(BaseModel):
     temperature: float
@@ -660,6 +663,7 @@ def _maybe_start_coordinated_sweep():
             iteration    = 0,
             converged    = False,
             sweep_queue  = grid,
+            sweep_total = len(grid),
             sweeping     = True,
             sweep_reason = "boot sweep (coordinated)",
             sweep_role   = role,
@@ -768,7 +772,30 @@ def heartbeat(data: HeartbeatIn):
 def esp32_get_state(station_id: str):
     return get_station(station_id)
 
+def get_device_status(sess: Optional[OptimSession]):
+    if not sess:
+        return {
+            "state": "IDLE",
+            "phase": None,
+            "sweeping": False,
+            "converged": False
+        }
 
+    if sess.phase == OptimPhase.COARSE and sess.sweeping:
+        state = "SWEEP"
+    elif sess.phase == OptimPhase.REFINE:
+        state = "REFINE"
+    elif sess.phase == OptimPhase.LOCK and sess.converged:
+        state = "LOCKED"
+    else:
+        state = "IDLE"
+
+    return {
+        "state": state,
+        "phase": sess.phase,
+        "sweeping": sess.sweeping,
+        "converged": sess.converged
+    }
 class AngleUpdateIn(BaseModel):
     station_id: str
     azimuth:    float
@@ -893,7 +920,20 @@ def report_error(data: ErrorIn):
 
 @app.get("/dashboard/stations")
 def get_all_stations():
-    return stations
+    result = {}
+    for sid, st in stations.items():
+        sess = optim_sessions.get(sid)
+        station_dict = st.model_dump()
+        station_dict["optim_phase"]        = sess.phase              if sess else None
+        station_dict["optim_sweeping"]     = sess.sweeping           if sess else False
+        station_dict["optim_converged"]    = sess.converged          if sess else False
+        station_dict["optim_sweep_total"]  = sess.sweep_total        if sess else 0
+        station_dict["optim_sweep_remaining"] = len(sess.sweep_queue) if sess else 0
+        station_dict["optim_progress_pct"] = _compute_progress_pct(sess) if sess else 0.0
+        station_dict["optim_lock_peak_variance"] = sess.lock_peak_variance if sess else 0.0
+        station_dict["device_status"]      = get_device_status(sess)
+        result[sid] = station_dict
+    return result
 
 
 class ManualCommandIn(BaseModel):
@@ -1145,6 +1185,12 @@ def system_status():
             "optim_best_signal":       sess.best_signal       if sess else None,
             "optim_collective_signal": sess.collective_best_signal if sess else None,
             "optim_sweep_remaining":   len(sess.sweep_queue)  if sess else 0,
+            "optim_sweep_total":       sess.sweep_total       if sess else 0,        # NEW
+            "optim_progress_pct":      _compute_progress_pct(sess) if sess else 0.0, # NEW
+            "optim_lock_peak_variance": sess.lock_peak_variance if sess else 0.0,
+            "onsite_override":         st.onsite_override,         # NEW
+            "override_started_at":     st.override_started_at,  # NEW
+            "device_status": get_device_status(sess)
         }
 
     if stations:
@@ -1327,11 +1373,13 @@ def _build_pdf() -> bytes:
         "SELECT station_id, ts, temperature, wind_speed, rain, humidity, pressure "
         "FROM env_log ORDER BY id DESC LIMIT 20"
     )
-    env_table = [["Station", "Timestamp", "Temp (°C)", "Wind (km/h)", "Rain", "Humidity", "Pressure"]]
+    env_table = [["Station", "Time", "Temp (°C)", "Wind (km/h)", "Rain", "Humidity", "Pressure"]]
     for row in env_rows_db:
+        ts_full = row["ts"]
+        time_only = ts_full[11:19] if len(ts_full) >= 19 else ts_full  # HH:MM:SS
         env_table.append([
             STATION_COORDS.get(row["station_id"], {}).get("label", row["station_id"]),
-            row["ts"][:16],
+            time_only,
             f"{row['temperature']:.1f}",
             f"{row['wind_speed']:.1f}",
             f"{row['rain']:.1f}",
@@ -1340,7 +1388,7 @@ def _build_pdf() -> bytes:
         ])
     if len(env_table) == 1:
         env_table.append(["No data"] + ["-"]*6)
-    t4 = Table(env_table, colWidths=[3.8*cm, 3*cm, 2*cm, 2.2*cm, 2*cm, 2.2*cm, 2.3*cm])
+    t4 = Table(env_table, colWidths=[5.3*cm, 1.8*cm, 2*cm, 2.2*cm, 1.6*cm, 2.1*cm, 2*cm])
     t4.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1e40af")),
         ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
@@ -1352,13 +1400,21 @@ def _build_pdf() -> bytes:
     story.append(t4)
     story.append(Spacer(1, 0.4*cm))
 
+    # Add a wrap-capable style for log messages
+    log_msg_style = ParagraphStyle("LogMsg", parent=body, fontSize=7, leading=9)
+
     story.append(Paragraph("6. System Logs (Last 30)", h1))
     log_rows = db_fetch(
         "SELECT ts, station_id, level, message FROM system_log ORDER BY id DESC LIMIT 30"
     )
     log_table = [["Timestamp", "Station", "Level", "Message"]]
     for row in log_rows:
-        log_table.append([row["ts"][:16], row["station_id"], row["level"], row["message"]])
+        log_table.append([
+            row["ts"][:16],
+            row["station_id"],
+            row["level"],
+            Paragraph(row["message"], log_msg_style),  # wraps within cell, grows row height
+        ])
     if len(log_table) == 1:
         log_table.append(["No logs"] + ["-"]*3)
     t5 = Table(log_table, colWidths=[3.5*cm, 3*cm, 2*cm, 9.5*cm])
@@ -1422,9 +1478,7 @@ async def optimizer_loop():
     while True:
         now = asyncio.get_event_loop().time()
 
-        # ── GUARD: only operate when both stations are present ─────────────
         if not both_stations_online():
-            # Mark any active sessions as IDLE so the dashboard shows the wait
             for sid in STATION_PAIR:
                 sess = optim_sessions.get(sid)
                 if sess and sess.active and not sess.converged:
@@ -1444,6 +1498,16 @@ async def optimizer_loop():
         st2 = stations.get(sid2)
         if not st1 or not st2:
             await asyncio.sleep(0.05)
+            continue
+
+        # ── GUARD: skip optimizer entirely if either station is under
+        # on-site technician override ──────────────────────────────────
+        if st1.onsite_override or st2.onsite_override:
+            for sid in STATION_PAIR:
+                sess = optim_sessions.get(sid)
+                if sess and sess.active and not sess.converged:
+                    sess.phase = OptimPhase.IDLE
+            await asyncio.sleep(0.5)
             continue
 
         # Ensure both are in AUTO
@@ -1519,6 +1583,7 @@ async def optimizer_loop():
                     # Reset to a probe sweep: one-waypoint queue = second-best position
                     # step_index 0 marks it as the probe point
                     rsess.sweep_queue     = [[probe_az, probe_el, 0]]
+                    rsess.sweep_total     = 1 
                     rsess.sweeping        = True
                     rsess.converged       = False
                     rsess.waiting_to_lock = False
@@ -1584,6 +1649,7 @@ async def optimizer_loop():
                         el_step  = RECAL_EL_STEP,
                         mirrored = mirrored,
                     )
+                    rsess.sweep_total  = len(rsess.sweep_queue)
                     rsess.sweeping        = True
                     rsess.converged       = False
                     rsess.waiting_to_lock = False
@@ -1816,6 +1882,10 @@ def _apply_lock(sid: str, sess: OptimSession, st: StationState,
         issued_at=datetime.now(timezone.utc),
         acknowledged=False,
     )
+    # Variance of the chosen lock signal from the best signal seen so far
+    peak_signal = max(sess.best_signal, signal)
+    sess.lock_peak_variance = abs(peak_signal - signal)   # NEW
+
     sess.best_az         = az
     sess.best_el         = el
     sess.best_signal     = signal
@@ -1825,8 +1895,8 @@ def _apply_lock(sid: str, sess: OptimSession, st: StationState,
     sess.phase           = OptimPhase.LOCK
     sess.locked_at       = loop_now
     log_to_db(sid,
-              f"LOCKED at collective best — AZ={az:.1f} EL={el:.1f} signal={signal:.1f} dBm", "INFO")
-
+              f"LOCKED at collective best — AZ={az:.1f} EL={el:.1f} signal={signal:.1f} dBm "
+              f"(peak variance={sess.lock_peak_variance:.2f} dB)", "INFO")
 
 async def heartbeat_monitor():
     while True:
@@ -1865,3 +1935,95 @@ async def startup():
     asyncio.create_task(auto_weather_refresh())
     asyncio.create_task(optimizer_loop())
     log_to_db("system", "Backend v4 started — coordinated sweep / collective lock active")
+
+def _compute_progress_pct(sess: OptimSession) -> float:
+    """Estimate completion % for the current optimizer phase."""
+    if sess.phase == OptimPhase.IDLE:
+        return 0.0
+    if sess.phase == OptimPhase.COARSE:
+        if sess.sweep_total <= 0:
+            return 0.0
+        done = sess.sweep_total - len(sess.sweep_queue)
+        return round(100.0 * done / sess.sweep_total, 1)
+    if sess.phase == OptimPhase.REFINE:
+        # Base on how close the recent signal variance is to the convergence threshold.
+        # variance starts high and must fall to <= 1.5 to converge.
+        if len(sess.samples) < 10:
+            return 0.0
+        recent = sess.samples[-10:]
+        variance = float(np.var([s.signal_dbm for s in recent]))
+        CONVERGE_THRESH = 1.5
+        STARTING_VARIANCE_EST = 15.0  # rough ceiling for normalisation
+        if variance <= CONVERGE_THRESH:
+            return 100.0
+        pct = 100.0 * (1.0 - min(1.0, variance / STARTING_VARIANCE_EST))
+        return round(max(0.0, pct), 1)
+    if sess.phase == OptimPhase.LOCK:
+        return 100.0
+    return 0.0
+
+class OverrideStartIn(BaseModel):
+    station_id: str
+
+
+@app.post("/esp32/override/start")
+def override_start(data: OverrideStartIn):
+    """
+    Called by the ESP32 when a technician logs in at the keypad
+    (correct PIN entered). Backend relinquishes control of this
+    station — optimizer loop must skip it while override is active.
+    """
+    station = get_station(data.station_id)
+    station.onsite_override     = True
+    station.override_started_at = datetime.now(timezone.utc)
+    station.mode = Mode.MANUAL          # backend stops issuing AUTO commands
+    station.command       = CommandState()
+    station.target_angles = None
+
+    # Pause any optimizer session so it doesn't fight the technician
+    sess = optim_sessions.get(data.station_id)
+    if sess and sess.active and not sess.converged:
+        sess.phase = OptimPhase.IDLE
+
+    log_to_db(data.station_id, "ON-SITE OVERRIDE — technician logged in at keypad", "WARN")
+    return {"status": "override_active", "station_id": data.station_id}
+
+
+class OverrideEndIn(BaseModel):
+    station_id: str
+    azimuth:    float
+    elevation:  float
+
+
+@app.post("/esp32/override/end")
+def override_end(data: OverrideEndIn):
+    """
+    Called by the ESP32 when the technician presses Save.
+    Records the final manual position and returns control to AUTO.
+    """
+    station = get_station(data.station_id)
+    station.current_angles = Angles(azimuth=data.azimuth, elevation=data.elevation)
+    station.onsite_override     = False
+    station.override_started_at = None
+    station.mode = Mode.AUTO
+
+    log_to_db(data.station_id,
+              f"Override ended — technician saved AZ={data.azimuth:.1f} "
+              f"EL={data.elevation:.1f}, control returned to AUTO", "WARN")
+
+    # Optimizer will resume on next heartbeat via _maybe_start_coordinated_sweep
+    # but only if both stations are online and no session is active/converged.
+    # Wipe this station's stale session so a fresh coordinated sweep can start
+    # from the new physical position.
+    optim_sessions.pop(data.station_id, None)
+
+    return {"status": "override_ended", "station_id": data.station_id}
+
+@app.post("/optimizer/check/{station_id}")
+def optimizer_check(station_id: str):
+    """Alias for optimizer status — accepts POST for legacy client compatibility."""
+    sess = optim_sessions.get(station_id)
+    if not sess:
+        return {"active": False, "station_id": station_id,
+                "waiting_for_partner": not both_stations_online()}
+    return sess

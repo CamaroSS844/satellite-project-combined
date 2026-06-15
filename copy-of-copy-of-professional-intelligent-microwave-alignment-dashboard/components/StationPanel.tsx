@@ -215,6 +215,60 @@ const STYLES = `
     font-size: 8px;
     color: #1e3a5a;
   }
+  .ma-link-status {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    font-size: 11px;
+  }
+  .ma-link-status-left {
+    display: flex; align-items: center; gap: 6px;
+  }
+  .ma-link-phase {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 10px;
+  }
+  .ma-link-progress-bg {
+    height: 4px; width: 70px; background: #1e2a4a;
+    border-radius: 2px; overflow: hidden;
+  }
+  .ma-link-progress-fill {
+    height: 100%; border-radius: 2px; transition: width 0.4s ease;
+  }
+  .ma-link-pct {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; color: #94a3b8;
+  }
+  .ma-link-variance {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; color: #64748b;
+  }
+
+  .ma-override-banner {
+    background: #2a1505;
+    border: 1px solid #92400e;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    color: #fbbf24;
+    animation: ma-pulse 1.5s ease-in-out infinite;
+  }
+  .ma-override-label {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 10px;
+  }
 `;
 
 function injectStyles() {
@@ -398,6 +452,27 @@ const StationPanel: React.FC<StationPanelProps> = ({
   const samplesRef = useRef<Sample[]>([]);
   const [samples, setSamples] = useState<Sample[]>([]);
 
+  
+  
+  function phaseLabel(phase: string | null, pct: number) {
+  switch (phase) {
+    case 'COARSE': return `Sweeping ${pct.toFixed(0)}%`;
+    case 'REFINE': return `Refining ${pct.toFixed(0)}%`;
+    case 'LOCK':   return 'Locked';
+    case 'IDLE':   return 'Waiting';
+    default:       return '—';
+  }
+}
+
+  function phaseColor(phase: string | null) {
+    switch (phase) {
+      case 'COARSE': return '#fbbf24'; // amber — searching
+      case 'REFINE':  return '#60a5fa'; // blue — narrowing
+      case 'LOCK':    return '#4ade80'; // green — done
+      default:        return '#475569';
+    }
+  }
+
   // Append live RSSI every time the prop changes (parent polls backend)
   useEffect(() => {
     if (!hasSignal(rssi)) return;
@@ -406,21 +481,22 @@ const StationPanel: React.FC<StationPanelProps> = ({
     setSamples([...samplesRef.current]);
   }, [rssi]);  // fires on every new rssi value
 
-  // Append a sample on every parent poll — always advance the time axis,
-  // only skip if rssi is the no-signal sentinel
-  const prevRssiRef = useRef<number>(-99);
-  useEffect(() => {
-    if (!hasSignal(rssi)) return;
-    // Always push a new timestamped point so the x-axis scrolls forward
-    const entry: Sample = { ts: Date.now(), dbm: rssi };
-    samplesRef.current = [...samplesRef.current, entry].slice(-MAX_SAMPLES);
-    setSamples([...samplesRef.current]);
-    prevRssiRef.current = rssi;
-  });  // ← no dependency array: runs on every render, which happens every time parent re-renders with new data
+
 
   // ── Canvas draw ─────────────────────────────────────────────────────────
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const lineColor = s.station_id === 'station_1' ? '#2563eb' : '#16a34a';
+
+  const onsiteOverride   = (s as any).onsite_override as boolean | undefined;
+  const overrideStarted  = (s as any).override_started_at as string | null | undefined;
+
+  function fmtOverrideDuration(startedAt: string | null | undefined) {
+    if (!startedAt) return null;
+    const start = new Date(startedAt).getTime();
+    const now = Date.now();
+    const mins = Math.max(0, Math.floor((now - start) / 60000));
+    return mins < 1 ? 'just now' : `${mins} min ago`;
+  }
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -454,15 +530,81 @@ const StationPanel: React.FC<StationPanelProps> = ({
     sendManualCommand(s.station_id, localAz, localEl);
   }
 
+  const optimSweeping = (s as any).optim_sweeping as boolean ?? false;
+const optimConverged = (s as any).optim_converged as boolean ?? false;
+
+const sweepTotal = (s as any).optim_sweep_total ?? 0;
+const sweepRemaining = (s as any).optim_sweep_remaining ?? 0;
+
+const progressPct =
+  sweepTotal > 0
+    ? ((sweepTotal - sweepRemaining) / sweepTotal) * 100
+    : 0;
+
+const lockVariance =
+  (s as any).optim_lock_peak_variance as number | undefined;
+
+function getOptimPhase(
+  sweeping: boolean,
+  converged: boolean
+): 'SWEEP' | 'REFINE' | 'LOCK' {
+  if (converged) return 'LOCK';
+  if (sweeping) return 'SWEEP';
+  return 'REFINE';
+}
+
+const optimPhase = getOptimPhase(
+  optimSweeping,
+  optimConverged
+);
+
+function phaseLabel(
+  phase: 'SWEEP' | 'REFINE' | 'LOCK',
+  pct: number
+) {
+  switch (phase) {
+    case 'SWEEP':
+      return `Sweep ${pct.toFixed(0)}%`;
+
+    case 'REFINE':
+      return `Refining`;
+
+    case 'LOCK':
+      return 'Locked';
+
+    default:
+      return 'Waiting';
+  }
+}
+
+function phaseColor(
+  phase: 'SWEEP' | 'REFINE' | 'LOCK'
+) {
+  switch (phase) {
+    case 'SWEEP':
+      return '#fbbf24';
+
+    case 'REFINE':
+      return '#60a5fa';
+
+    case 'LOCK':
+      return '#4ade80';
+
+    default:
+      return '#475569';
+  }
+}
   const hasError = s.error.has_error;
   const pending  = s.command.pending;
   const isManual = s.mode === OperationalMode.MANUAL;
-  const disabled = !online || !isManual || pending || hasError;
+  const disabled = !online || !isManual || pending || hasError || !!onsiteOverride;
   const lqi      = lqiFromRssi(rssi);
   const displayName = s.station_id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
   const firstTs = samples.length > 0 ? fmtTime(samples[0].ts) : null;
   const lastTs  = samples.length > 0 ? fmtTime(samples[samples.length - 1].ts) : null;
+
+  
 
   return (
     <div className="ma-card">
@@ -480,6 +622,45 @@ const StationPanel: React.FC<StationPanelProps> = ({
           </span>
         </div>
       </div>
+
+      {/* ── On-site override banner ── */}
+      {onsiteOverride && (
+        <div className="ma-override-banner">
+          <span>
+            <span className="ma-override-label">⚠ TECHNICIAN ON SITE — </span>
+            Manual override active{overrideStarted ? ` (${fmtOverrideDuration(overrideStarted)})` : ''}
+          </span>
+        </div>
+      )}
+
+      {/* ── Link status: sweep / refine / lock ── */}
+      <div className="ma-link-status">
+  <div className="ma-link-status-left">
+    <span className="ma-dot" style={{ background: phaseColor(optimPhase) }} />
+    <span className="ma-link-phase" style={{ color: phaseColor(optimPhase) }}>
+      {phaseLabel(optimPhase, progressPct)}
+    </span>
+  </div>
+
+  {optimPhase === 'LOCK' ? (
+    <span className="ma-link-variance">
+      Δ from peak: {lockVariance != null ? `${lockVariance.toFixed(2)} dB` : '—'}
+    </span>
+  ) : optimPhase === 'IDLE' || optimPhase == null ? (
+    <span className="ma-link-variance">Waiting for both stations…</span>
+  ) : (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div className="ma-link-progress-bg">
+        <div className="ma-link-progress-fill"
+          style={{
+            width: `${progressPct}%`,
+            background: phaseColor(optimPhase),
+          }} />
+      </div>
+      <span className="ma-link-pct">{progressPct.toFixed(0)}%</span>
+    </div>
+  )}
+</div>
 
       {/* ── Angle gauges ── */}
       <div className="ma-gauge-row">
@@ -561,7 +742,7 @@ const StationPanel: React.FC<StationPanelProps> = ({
             {[OperationalMode.AUTO, OperationalMode.MANUAL].map(m => (
               <button key={m}
                 className={`ma-mode-btn ${s.mode === m ? 'ma-mode-on' : 'ma-mode-off'}`}
-                disabled={!online || hasError}
+                disabled={!online || hasError || !!onsiteOverride}
                 onClick={() => setMode(m)}>
                 {m}
               </button>

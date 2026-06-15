@@ -57,7 +57,10 @@ const App: React.FC = () => {
 
         <div className="col-span-12 lg:col-span-12 space-y-4">
           {/* Environmental panel mapping updated to support multiple stations if available */}
-          <EnvironmentalPanel stationA={stations[0] || {} as any} stationB={stations[1] || {} as any} />
+          <EnvironmentalPanel 
+          stationA={stations[0] || {} as any} stationB={stations[1] || {} as any} 
+          
+          />
           <KpiPanel kpis={kpis} />
         </div>
 

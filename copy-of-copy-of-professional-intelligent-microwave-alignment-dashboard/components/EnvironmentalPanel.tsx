@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 
 // ── Types matching your backend's WeatherData model ──────────────────────────
 interface WeatherData {
@@ -16,6 +16,10 @@ interface EnvironmentalResponse {
   user_location?: WeatherData | null;
   user_lat?: number | null;
   user_lon?: number | null;
+}
+
+interface StationLike {
+  signal_dbm?: number;
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -53,13 +57,6 @@ const styles = {
     letterSpacing: '0.08em',
     textTransform: 'uppercase' as const,
     marginBottom: '4px',
-  } as React.CSSProperties,
-
-  kpiNum: {
-    fontFamily: "'IBM Plex Mono', monospace",
-    fontSize: '17px',
-    fontWeight: 500,
-    color: '#e2e8f0',
   } as React.CSSProperties,
 
   pill: {
@@ -164,11 +161,135 @@ const Bar: React.FC<{ pct: number; color: string }> = ({ pct, color }) => (
   </div>
 );
 
+// ── History sample type ───────────────────────────────────────────────────────
+interface HistorySample {
+  ts: number;
+  humidity: number;
+  rain: number;
+  wind: number;
+  signal: number | null; // null when no station has a valid signal yet
+}
+
+const MAX_HISTORY_SAMPLES = 288; // ~24h at 5-min cadence
+
+// ── Series config for the multi-line graph ─────────────────────────────────
+interface SeriesConfig {
+  key: 'humidity' | 'rain' | 'wind' | 'signal';
+  label: string;
+  color: string;
+  unit: string;
+  // map raw value -> 0..1 for plotting on a shared axis
+  normalize: (v: number) => number;
+  format: (v: number) => string;
+}
+
+const SERIES: SeriesConfig[] = [
+  {
+    key: 'humidity',
+    label: 'Humidity',
+    color: '#60a5fa',
+    unit: '%',
+    normalize: (v) => Math.max(0, Math.min(100, v)) / 100,
+    format: (v) => `${Math.round(v)}%`,
+  },
+  {
+    key: 'rain',
+    label: 'Rain',
+    color: '#38bdf8',
+    unit: 'mm/h',
+    // rain rates are typically small; scale 0-20mm/h to 0..1
+    normalize: (v) => Math.max(0, Math.min(20, v)) / 20,
+    format: (v) => `${v.toFixed(1)}`,
+  },
+  {
+    key: 'wind',
+    label: 'Wind',
+    color: '#fbbf24',
+    unit: 'km/h',
+    // scale 0-60 km/h to 0..1
+    normalize: (v) => Math.max(0, Math.min(60, v)) / 60,
+    format: (v) => `${v.toFixed(1)}`,
+  },
+  {
+    key: 'signal',
+    label: 'Avg signal',
+    color: '#4ade80',
+    unit: 'dBm',
+    // signal range -90..0 dBm -> 0..1
+    normalize: (v) => Math.max(0, Math.min(90, v + 90)) / 90,
+    format: (v) => `${v.toFixed(1)}`,
+  },
+];
+
+// ── Canvas draw — multi-series, normalized 0..1, against wall-clock time ─────
+function drawWeatherGraph(canvas: HTMLCanvasElement, samples: HistorySample[]) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // ── grid lines (4 horizontal bands) ─────────────────────────────────────
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = (H / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+
+  if (samples.length < 2) return;
+
+  const t0 = samples[0].ts;
+  const t1 = samples[samples.length - 1].ts;
+  const tRange = t1 - t0 || 1;
+  const toX = (ts: number) => ((ts - t0) / tRange) * W;
+  const toY = (norm: number) => H - Math.max(0, Math.min(1, norm)) * H;
+
+  for (const series of SERIES) {
+    // Build list of points, skipping samples where the value is null (signal)
+    const pts: { x: number; y: number }[] = [];
+    for (const s of samples) {
+      const raw = s[series.key];
+      if (raw === null || raw === undefined) continue;
+      pts.push({ x: toX(s.ts), y: toY(series.normalize(raw)) });
+    }
+    if (pts.length < 2) continue;
+
+    ctx.beginPath();
+    ctx.strokeStyle = series.color;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    pts.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    });
+    ctx.stroke();
+
+    // dot at latest point for this series
+    const last = pts[pts.length - 1];
+    ctx.beginPath();
+    ctx.arc(last.x, last.y, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = series.color;
+    ctx.fill();
+  }
+}
+
+function fmtTime(ts: number) {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+}
+
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface EnvironmentalPanelProps {
   userLat?: number;
   userLon?: number;
   refreshInterval?: number;
+  stationA?: StationLike;
+  stationB?: StationLike;
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
@@ -176,11 +297,18 @@ const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
   userLat,
   userLon,
   refreshInterval = REFRESH_INTERVAL_MS,
+  stationA,
+  stationB,
 }) => {
   const [data, setData] = useState<EnvironmentalResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
+
+  // ── Weather/signal history ────────────────────────────────────────────────
+  const historyRef = useRef<HistorySample[]>([]);
+  const [history, setHistory] = useState<HistorySample[]>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const fetchEnvironmental = useCallback(async () => {
     try {
@@ -206,6 +334,54 @@ const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
     const interval = setInterval(fetchEnvironmental, refreshInterval);
     return () => clearInterval(interval);
   }, [fetchEnvironmental, refreshInterval]);
+
+  // ── Append a history sample whenever fresh weather data arrives ──────────
+  useEffect(() => {
+    if (!data) return;
+
+    const { station_a: a, station_b: b } = data;
+
+    const sigA = stationA?.signal_dbm;
+    const sigB = stationB?.signal_dbm;
+    const validSigs = [sigA, sigB].filter(
+      (v): v is number => typeof v === 'number' && v > -99
+    );
+    const avgSignal = validSigs.length > 0
+      ? validSigs.reduce((sum, v) => sum + v, 0) / validSigs.length
+      : null;
+
+    const entry: HistorySample = {
+      ts: Date.now(),
+      humidity: (a.humidity + b.humidity) / 2,
+      rain: Math.max(a.rain, b.rain),
+      wind: Math.max(a.wind_speed, b.wind_speed),
+      signal: avgSignal,
+    };
+
+    historyRef.current = [...historyRef.current, entry].slice(-MAX_HISTORY_SAMPLES);
+    setHistory([...historyRef.current]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
+
+  // ── Draw the graph ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    function syncAndDraw() {
+      const parent = canvas!.parentElement;
+      const w = (parent?.offsetWidth || 300);
+      canvas!.width = w;
+      canvas!.height = 90;
+      drawWeatherGraph(canvas!, historyRef.current);
+    }
+
+    syncAndDraw();
+
+    const ro = new ResizeObserver(syncAndDraw);
+    ro.observe(canvas.parentElement ?? canvas);
+    return () => ro.disconnect();
+  }, [history]);
 
   // ── Loading ───────────────────────────────────────────────────────────────
   if (loading) {
@@ -240,6 +416,10 @@ const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
   const { station_a: a, station_b: b, user_location: u } = data;
   const wx = getImpact(a, b);
   const maxWind = Math.max(a.wind_speed, b.wind_speed);
+
+  const firstTs = history.length > 0 ? fmtTime(history[0].ts) : null;
+  const lastTs = history.length > 0 ? fmtTime(history[history.length - 1].ts) : null;
+  const latest = history.length > 0 ? history[history.length - 1] : null;
 
   // ── Main render ───────────────────────────────────────────────────────────
   return (
@@ -427,6 +607,43 @@ const EnvironmentalPanel: React.FC<EnvironmentalPanelProps> = ({
           </div>
         </div>
       )}
+
+      {/* ── Weather vs signal history graph ── */}
+      <div style={{ marginTop: '12px', borderTop: '1px solid #1e2a4a', paddingTop: '12px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '5px' }}>
+          <div style={{ fontSize: '10px', color: '#475569', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+            Weather vs signal · history
+          </div>
+          <div style={{ ...styles.mono, fontSize: '10px', color: '#475569' }}>
+            {history.length > 0 ? `${history.length} pts` : 'waiting…'}
+          </div>
+        </div>
+
+        {/* Legend */}
+        <div style={{ display: 'flex', gap: '14px', marginBottom: '6px', flexWrap: 'wrap' }}>
+          {SERIES.map(s => {
+            const val = latest ? latest[s.key] : null;
+            return (
+              <div key={s.key} style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '10px', color: '#94a3b8' }}>
+                <span style={{ width: '8px', height: '8px', borderRadius: '2px', background: s.color, display: 'inline-block' }} />
+                <span>{s.label}</span>
+                <span style={{ ...styles.mono, color: '#e2e8f0' }}>
+                  {val !== null && val !== undefined ? `${s.format(val)} ${s.unit}` : '—'}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ position: 'relative', width: '100%', height: '90px' }}>
+          <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', borderRadius: '3px', background: '#060b18' }} />
+        </div>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '2px' }}>
+          <span style={{ ...styles.mono, fontSize: '8px', color: '#1e3a5a' }}>{firstTs ?? '—'}</span>
+          <span style={{ ...styles.mono, fontSize: '8px', color: '#1e3a5a' }}>{lastTs ?? '—'}</span>
+        </div>
+      </div>
     </div>
   );
 };
